@@ -93,7 +93,14 @@ COMPACT_N_CTX = int(os.environ.get("COMPACT_N_CTX", "0"))
 # "turn off the kitchen light" should not be paying for tool definitions, and
 # should not be holding kubectl.
 TOOLS_ENABLED = os.environ.get("GATEWAY_TOOLS", "0") not in ("0", "false", "no", "")
-TOOL_MAX_STEPS = int(os.environ.get("TOOL_MAX_STEPS", "12"))
+TOOL_MAX_STEPS = int(os.environ.get("TOOL_MAX_STEPS", "8"))
+# Wall-clock budget for starting NEW tool work, in seconds. A step budget does
+# not bound time: steps get slower as the conversation grows, so 12 steps can
+# be two minutes or twelve. Callers have their own timeouts — cluster-agent
+# waits 300s — and a loop that outruns them does the work, gets abandoned, and
+# reports nothing. Past this the tools are withdrawn and the model must answer,
+# leaving the remainder of the caller's patience for that final reply.
+TOOL_MAX_SECONDS = int(os.environ.get("TOOL_MAX_SECONDS", "180"))
 TOOL_OUTPUT_MAX = int(os.environ.get("TOOL_OUTPUT_MAX", "8000"))
 KUBECTL_TIMEOUT_S = int(os.environ.get("KUBECTL_TIMEOUT_S", "60"))
 # Guidance injected with the tools. The client never asked for the tools and

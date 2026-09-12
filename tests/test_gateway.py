@@ -598,6 +598,23 @@ async def run_all():
             senders = [x[2] for x in rows(t)]
             check("every archived step still chunks with a sender",
                   senders == ["User", "Claude", "User", "Claude"], str(senders))
+        # Wall clock, not just steps: a caller with its own timeout (cluster-agent
+        # waits 300s) must get an answer, not an abandoned investigation.
+        was_secs, gcfg.TOOL_MAX_SECONDS = gcfg.TOOL_MAX_SECONDS, 0
+        try:
+            NEXT_QUEUE[:] = [{"content": "Answering from what I have."}]
+            obj = await chat([{"role": "user", "content": "Out of time please."}],
+                             stream=False, headers=AUTH)
+            check("a spent time budget withdraws the tools and forces an answer",
+                  "tools" not in LAST_UPSTREAM
+                  and "Answering from what I have."
+                  in (obj["choices"][0]["message"].get("content") or ""),
+                  f"tools_offered={'tools' in LAST_UPSTREAM}")
+            check("and it says so in the prompt, so the model knows why",
+                  "tool budget is spent" in json.dumps(LAST_UPSTREAM))
+        finally:
+            gcfg.TOOL_MAX_SECONDS = was_secs
+
         NEXT_QUEUE[:] = [
             {"tool_calls": [{"id": "f1", "type": "function", "function": {
                 "name": "finish",

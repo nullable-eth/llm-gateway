@@ -17,6 +17,7 @@ gateway took it over.
 """
 import json
 import logging
+import time
 
 from . import config, tools
 
@@ -50,11 +51,17 @@ async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[
     messages = list(body.get("messages") or [])
     headers = {"Authorization": auth} if auth else {}
     last = None
+    deadline = time.monotonic() + config.TOOL_MAX_SECONDS
 
     for step in range(config.TOOL_MAX_STEPS):
-        # Only the last step drops the tools, to force a written answer rather
-        # than a tool call the loop has no budget left to execute.
-        offer_tools = step < config.TOOL_MAX_STEPS - 1
+        # Tools are withdrawn on the last step, or once the wall-clock budget
+        # is spent, so the model has to answer rather than start work nobody
+        # will wait for.
+        out_of_time = time.monotonic() >= deadline
+        offer_tools = step < config.TOOL_MAX_STEPS - 1 and not out_of_time
+        if out_of_time and step:
+            log.info("agentloop: time budget spent after %d step(s); "
+                     "forcing an answer", step)
         call_body = dict(body)
         call_body["messages"] = messages
         call_body["stream"] = False
@@ -63,8 +70,8 @@ async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[
         else:
             call_body.pop("tools", None)
             messages = messages + [{"role": "user", "content":
-                "Tool budget exhausted. Answer now from what you already have, "
-                "and say plainly what you could not determine."}]
+                "Your tool budget is spent. Answer now from what you already "
+                "have, and say plainly what you could not determine."}]
             call_body["messages"] = messages
 
         r = await client.post(f"{upstream}/v1/chat/completions", json=call_body,

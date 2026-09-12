@@ -102,7 +102,8 @@ Until then, treat the inference key as cluster-read-capable.
 | `COMPACT_N_CTX` | `0` | Override the probed window — **set this when the server runs more than one slot**, since what matters is `n_ctx / n_parallel` |
 | `MODE` | `propose` | `propose` or `auto`; auto alone still needs phase-2 RBAC |
 | `PROTECTED` | *(empty)* | Components the agent may not act on |
-| `TOOL_MAX_STEPS` | `12` | Model+tool round trips before it must answer |
+| `TOOL_MAX_STEPS` | `8` | Model+tool round trips before it must answer |
+| `TOOL_MAX_SECONDS` | `180` | Wall-clock budget for starting new tool work; past it the tools are withdrawn |
 | `TOOL_SYSTEM_PROMPT` | *(built-in)* | Tool-use policy appended to the caller's system message; empty disables |
 | `HA_URL` / `HA_TOKEN` | *(empty)* | Home Assistant; empty disables those tools |
 | `MEMORY_URL` / `MEMORY_TOKEN` | *(empty)* | agentmemory search; empty disables that tool |
@@ -115,6 +116,13 @@ Full list in `gateway/config.py`, which is the only place env is read.
   upstream calls, so there is no single stream to pass through; the finished
   answer is chunked into SSE frames. Clients render it fine, but it arrives in
   blocks rather than token by token.
+- **A loop must finish inside its caller's patience.** Steps do not bound
+  wall clock — they get slower as the conversation grows — so there is a
+  separate `TOOL_MAX_SECONDS` budget, past which the tools are withdrawn and
+  the model must answer. A loop that outruns its caller does the work, gets
+  abandoned, and reports nothing: cluster-agent waits 300s and then posts
+  `LLM error at step 1:` with an empty message, because `httpx.ReadTimeout`
+  stringifies to nothing.
 - **Concurrency is the server's.** With `--parallel 1` a tool loop holds the
   only slot for its whole run, so an alert investigation and an interactive
   question block each other. Raising `--parallel` partitions the same
