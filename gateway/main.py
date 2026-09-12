@@ -19,7 +19,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from prometheus_client import generate_latest
 
-from . import agentloop, compact, config, forward, metrics
+from . import agentloop, compact, config, forward, metrics, policy
 from .capture import normalize, sse, store
 from .capture.writer import Writer
 
@@ -229,11 +229,13 @@ async def proxy(path: str, request: Request):
     # own. The archive gets the whole loop, which the client never saw.
     if parsed is not None and config.TOOLS_ENABLED:
         auth = request.headers.get("authorization") or ""
-        sent = list((parsed if new_body is None else new_body).get("messages") or [])
+        loop_body = dict(new_body or parsed)
+        loop_body["messages"] = policy.apply(loop_body.get("messages") or [])
+        sent = list(loop_body["messages"])
         try:
             final, produced = await agentloop.run(
-                client, config.UPSTREAM,
-                dict(new_body or parsed), auth, request.app.state.compactor)
+                client, config.UPSTREAM, loop_body, auth,
+                request.app.state.compactor)
         except Exception as e:
             metrics.UPSTREAM_ERRORS.labels(endpoint=endpoint).inc()
             log.exception("agentloop failed")

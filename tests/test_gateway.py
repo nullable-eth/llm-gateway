@@ -552,6 +552,19 @@ async def run_all():
     finally:
         gtools.get_context = real_ctx
 
+    from gateway import policy
+    merged = policy.apply([{"role": "system", "content": "You are Jeeves."},
+                           {"role": "user", "content": "hi"}])
+    check("policy is appended to the caller's system message, not replacing it",
+          merged[0]["role"] == "system"
+          and merged[0]["content"].startswith("You are Jeeves.")
+          and "get_context" in merged[0]["content"], str(merged[0])[:120])
+    check("policy does not disturb the rest of the conversation",
+          merged[1:] == [{"role": "user", "content": "hi"}])
+    added = policy.apply([{"role": "user", "content": "hi"}])
+    check("a conversation with no system message gets one",
+          added[0]["role"] == "system" and len(added) == 2)
+
     # run_kubectl is stubbed: a test that shells out to the real cluster is
     # not a test, it is an incident.
     real_kubectl, gtools.run_kubectl = gtools.run_kubectl, (

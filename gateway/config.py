@@ -96,6 +96,10 @@ TOOLS_ENABLED = os.environ.get("GATEWAY_TOOLS", "0") not in ("0", "false", "no",
 TOOL_MAX_STEPS = int(os.environ.get("TOOL_MAX_STEPS", "12"))
 TOOL_OUTPUT_MAX = int(os.environ.get("TOOL_OUTPUT_MAX", "8000"))
 KUBECTL_TIMEOUT_S = int(os.environ.get("KUBECTL_TIMEOUT_S", "60"))
+# Guidance injected with the tools. The client never asked for the tools and
+# cannot know how to budget them, so the policy travels with them. Empty
+# disables. Default lives in policy.py.
+TOOL_SYSTEM_PROMPT = os.environ.get("TOOL_SYSTEM_PROMPT", "__default__")
 
 # propose | auto. Mutations are recorded rather than executed unless auto, and
 # auto alone still does nothing without the phase-2 RBAC.

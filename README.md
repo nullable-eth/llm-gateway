@@ -49,7 +49,14 @@ return one finished answer. `search_memory` returns scored snippets each
 carrying a `message_uuid`, and `get_context` reads the archived conversation
 around one — without that second tool a model that finds a snippet too short
 can only search again with different words, which it will do until it runs out
-of steps. The client sees a single reply; the archive gets
+of steps.
+
+The tools arrive with a **use policy** appended to the caller's system message
+(`gateway/policy.py`). The client never asked for these tools and cannot know
+how to budget them, so injecting the tools without the guidance is an
+incomplete feature: measured against the live archive, a model given
+search_memory and no policy ran it thirteen times in one request, each a
+reword of the last. `TOOL_SYSTEM_PROMPT=""` disables it. The client sees a single reply; the archive gets
 every tool call, result and intermediate thought. Compaction runs *between*
 steps too, because tool output is what actually overflows a window.
 
@@ -96,6 +103,7 @@ Until then, treat the inference key as cluster-read-capable.
 | `MODE` | `propose` | `propose` or `auto`; auto alone still needs phase-2 RBAC |
 | `PROTECTED` | *(empty)* | Components the agent may not act on |
 | `TOOL_MAX_STEPS` | `12` | Model+tool round trips before it must answer |
+| `TOOL_SYSTEM_PROMPT` | *(built-in)* | Tool-use policy appended to the caller's system message; empty disables |
 | `HA_URL` / `HA_TOKEN` | *(empty)* | Home Assistant; empty disables those tools |
 | `MEMORY_URL` / `MEMORY_TOKEN` | *(empty)* | agentmemory search; empty disables that tool |
 
