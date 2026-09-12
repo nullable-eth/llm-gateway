@@ -128,3 +128,13 @@ that shells out to a real cluster is not a test.
 ## Release
 
 Push to `main` → `:latest` + `:sha-…`. Tag `vX.Y.Z` → `:X.Y.Z`. Pin by `sha-`.
+
+## A note on the image path
+
+Published as `ghcr.io/nullable-eth/llm-gateway/app`, not
+`ghcr.io/nullable-eth/llm-gateway`. The repo started private, so the package
+created by the first build inherited private visibility, and GHCR package
+visibility is separate from repo visibility — it cannot be changed without a
+token carrying `packages` scope. The repo is public now, so a *new* package
+path is created public. Flip the original package to public in the GitHub UI
+and this can move back to the plain repo name.
