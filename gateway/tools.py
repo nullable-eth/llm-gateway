@@ -131,6 +131,18 @@ TOOLS = [
         "description": "Home Assistant: call a service (e.g. switch.turn_off). Executes only in auto mode; otherwise recorded as a proposal.",
         "parameters": {"type": "object", "properties": {"domain": {"type": "string"}, "service": {"type": "string"},
             "entity_id": {"type": "string"}, "data": {"type": "object"}}, "required": ["domain", "service"]}}},
+    # Not dispatched — agentloop intercepts it and ends the run. It exists so
+    # an agent has an explicit way to say "I am done" instead of trailing off,
+    # and so a caller whose prompt asks for a structured report still gets the
+    # fields it asked for rather than prose.
+    {"type": "function", "function": {"name": "finish",
+        "description": "End the run with a report. Call this exactly once when diagnosis or action is complete.",
+        "parameters": {"type": "object", "properties": {
+            "summary": {"type": "string", "description": "what happened and root cause"},
+            "actions_taken": {"type": "array", "items": {"type": "string"}},
+            "proposals": {"type": "array", "items": {"type": "string"},
+                "description": "mutations a human should run or approve, exact commands"}},
+            "required": ["summary"]}}},
     {"type": "function", "function": {"name": "search_memory",
         "description": "Search the operator's long-term conversation archive for prior incidents, decisions and known fixes.",
         "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "k": {"type": "integer"}},

@@ -34,6 +34,17 @@ def _args_of(call: dict) -> dict:
         return {}
 
 
+def _render_finish(args: dict) -> str:
+    out = [str(args.get("summary") or "").strip()]
+    for label, key in (("Actions taken", "actions_taken"), ("Proposals", "proposals")):
+        items = args.get(key) or []
+        if isinstance(items, str):
+            items = [items]
+        if items:
+            out.append(f"**{label}**\n" + "\n".join(f"- {i}" for i in items))
+    return "\n\n".join(x for x in out if x) or "(no summary given)"
+
+
 async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[dict, list]:
     """Returns (final upstream response, full message list including tool traffic)."""
     messages = list(body.get("messages") or [])
@@ -72,6 +83,17 @@ async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[
 
         if not calls:
             return last, messages
+
+        # finish() ends the run. Its fields become the answer, so a caller
+        # whose prompt asks for a structured report gets one.
+        for call in calls:
+            if ((call.get("function") or {}).get("name")) == "finish":
+                report = _render_finish(_args_of(call))
+                assistant["content"] = report
+                assistant.pop("tool_calls", None)
+                last.setdefault("choices", [{}])[0]["message"] = dict(assistant)
+                last["choices"][0]["finish_reason"] = "stop"
+                return last, messages
 
         for call in calls:
             name = (call.get("function") or {}).get("name") or ""

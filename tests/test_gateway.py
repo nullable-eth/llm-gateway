@@ -565,6 +565,20 @@ async def run_all():
             senders = [x[2] for x in rows(t)]
             check("every archived step still chunks with a sender",
                   senders == ["User", "Claude", "User", "Claude"], str(senders))
+        NEXT_QUEUE[:] = [
+            {"tool_calls": [{"id": "f1", "type": "function", "function": {
+                "name": "finish",
+                "arguments": json.dumps({"summary": "Image pull failed.",
+                                         "actions_taken": ["read events"],
+                                         "proposals": ["kubectl -n ai get ev"]})}}]},
+        ]
+        obj = await chat([{"role": "user", "content": "Diagnose the alert."}],
+                         stream=False, headers=AUTH)
+        content = obj["choices"][0]["message"].get("content") or ""
+        check("finish() ends the run and becomes the answer",
+              "Image pull failed." in content and "Proposals" in content
+              and not obj["choices"][0]["message"].get("tool_calls"),
+              content[:200])
     finally:
         gcfg.TOOLS_ENABLED = was_enabled
         gtools.run_kubectl = real_kubectl
