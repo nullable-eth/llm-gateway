@@ -7,7 +7,7 @@ client they use:
 - **logging** — every conversation archived as markdown into an agentmemory vault
 - **compaction** — conversations that would overflow the context are summarised
 - **tools** — the gateway runs the tool loop, so clients with no tool support
-  can still ask questions that need `kubectl`
+  can still ask questions that need `kubectl` or the memory archive
 
 Point your Service at the gateway and let it forward to the model. Clients need
 no changes at all.
@@ -45,7 +45,11 @@ complete and the reply records `context_compacted`. Token counts are exact,
 from the server's own `/apply-template` and `/tokenize`.
 
 **tools** runs the loop: call the model, execute what it asks for, repeat,
-return one finished answer. The client sees a single reply; the archive gets
+return one finished answer. `search_memory` returns scored snippets each
+carrying a `message_uuid`, and `get_context` reads the archived conversation
+around one — without that second tool a model that finds a snippet too short
+can only search again with different words, which it will do until it runs out
+of steps. The client sees a single reply; the archive gets
 every tool call, result and intermediate thought. Compaction runs *between*
 steps too, because tool output is what actually overflows a window.
 
@@ -129,12 +133,3 @@ that shells out to a real cluster is not a test.
 
 Push to `main` → `:latest` + `:sha-…`. Tag `vX.Y.Z` → `:X.Y.Z`. Pin by `sha-`.
 
-## A note on the image path
-
-Published as `ghcr.io/nullable-eth/llm-gateway/app`, not
-`ghcr.io/nullable-eth/llm-gateway`. The repo started private, so the package
-created by the first build inherited private visibility, and GHCR package
-visibility is separate from repo visibility — it cannot be changed without a
-token carrying `packages` scope. The repo is public now, so a *new* package
-path is created public. Flip the original package to public in the GitHub UI
-and this can move back to the plain repo name.

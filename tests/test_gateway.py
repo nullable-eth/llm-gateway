@@ -532,6 +532,26 @@ async def run_all():
     check("guard refuses mutations in propose mode",
           gtools.kubectl_guard(["delete", "pod", "something"]) is not None)
 
+    names = {t["function"]["name"] for t in gtools.TOOLS}
+    check("memory search and context are both offered, not just search",
+          {"search_memory", "get_context"} <= names, str(sorted(names)))
+    check("search's description points at get_context rather than re-searching",
+          "get_context" in [t["function"]["description"]
+                            for t in gtools.TOOLS
+                            if t["function"]["name"] == "search_memory"][0])
+    check("an unknown tool is refused, not crashed on",
+          (await gtools.dispatch("nope", {})).startswith("REFUSED"))
+    async def _fake_ctx(u, r=3):
+        return f"WINDOW around {u} radius {r}"
+    real_ctx, gtools.get_context = gtools.get_context, _fake_ctx
+    try:
+        check("get_context dispatches with its uuid and radius",
+              await gtools.dispatch("get_context",
+                                    {"message_uuid": "abc", "radius": 5})
+              == "WINDOW around abc radius 5")
+    finally:
+        gtools.get_context = real_ctx
+
     # run_kubectl is stubbed: a test that shells out to the real cluster is
     # not a test, it is an incident.
     real_kubectl, gtools.run_kubectl = gtools.run_kubectl, (

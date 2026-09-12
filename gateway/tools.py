@@ -106,6 +106,29 @@ async def ha_call_service(domain: str, service: str, entity_id: str = "",
     return f"HTTP {r.status_code}: {r.text[:2000]}"
 
 
+async def get_context(message_uuid: str, radius: int = 3) -> str:
+    """Read the conversation around a search hit.
+
+    Without this the model only ever sees 500-char snippets, and when a snippet
+    is not enough it does the only thing it can — searches again, with slightly
+    different words, until it runs out of steps. Observed doing exactly that
+    six times in one run before this existed.
+    """
+    if not config.MEMORY_URL:
+        return "memory service is not configured (MEMORY_URL unset)"
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get(f"{config.MEMORY_URL}/context/{message_uuid}",
+                            params={"radius": radius},
+                            headers={"Authorization": f"Bearer {config.MEMORY_TOKEN}"})
+        if r.status_code == 404:
+            return (f"no archived message with uuid {message_uuid} — use the "
+                    f"message_uuid from a search_memory hit, verbatim")
+        return r.text[:config.TOOL_OUTPUT_MAX]
+    except Exception as exc:
+        return f"memory unavailable: {exc}"
+
+
 async def search_memory(query: str, k: int = 6) -> str:
     if not config.MEMORY_URL:
         return "memory service is not configured (MEMORY_URL unset)"
@@ -144,9 +167,13 @@ TOOLS = [
                 "description": "mutations a human should run or approve, exact commands"}},
             "required": ["summary"]}}},
     {"type": "function", "function": {"name": "search_memory",
-        "description": "Search the operator's long-term conversation archive for prior incidents, decisions and known fixes.",
+        "description": "Search the operator's long-term conversation archive for prior incidents, decisions and known fixes. Returns scored snippets, each with a message_uuid. When a snippet is not enough, call get_context on its message_uuid rather than searching again.",
         "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "k": {"type": "integer"}},
             "required": ["query"]}}},
+    {"type": "function", "function": {"name": "get_context",
+        "description": "Read the archived conversation surrounding a search_memory hit, verbatim. Use the message_uuid from a hit; radius is how many messages either side.",
+        "parameters": {"type": "object", "properties": {"message_uuid": {"type": "string"}, "radius": {"type": "integer"}},
+            "required": ["message_uuid"]}}},
 ]
 
 
@@ -160,4 +187,7 @@ async def dispatch(name: str, args: dict) -> str:
                                      args.get("entity_id", ""), args.get("data"))
     if name == "search_memory":
         return await search_memory(args.get("query", ""), int(args.get("k", 6) or 6))
+    if name == "get_context":
+        return await get_context(args.get("message_uuid", ""),
+                                 int(args.get("radius", 3) or 3))
     return f"REFUSED: unknown tool '{name}'"
