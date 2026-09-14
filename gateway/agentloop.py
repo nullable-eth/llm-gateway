@@ -15,6 +15,7 @@ actually overflows a window — a few `kubectl get events` dumps will do it —
 and this is the same job cluster-agent's trim_old_results() did before the
 gateway took it over.
 """
+import asyncio
 import json
 import logging
 import time
@@ -95,8 +96,20 @@ async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[
         # seconds to say what it found, time out, and report nothing at all.
         budget = (max(config.UPSTREAM_MIN_TIMEOUT_S, hard_deadline - time.monotonic())
                   if offer_tools else config.ANSWER_TIMEOUT_S)
-        r = await client.post(f"{upstream}/v1/chat/completions", json=call_body,
-                              headers=headers, timeout=budget)
+        # llama.cpp answers 500 when a sampled tool call comes out malformed —
+        # truncated mid-arguments, usually — and a fresh sample almost always
+        # parses. cluster-agent used to absorb that when it talked to the model
+        # directly; nothing did after the loop moved here, so one bad sample
+        # became a 502 in a phone client's face and a 30-second backoff in the
+        # agent's. Retried here, where the bad sample actually happens.
+        for attempt in range(3):
+            r = await client.post(f"{upstream}/v1/chat/completions", json=call_body,
+                                  headers=headers, timeout=budget)
+            if r.status_code < 500 or attempt == 2:
+                break
+            log.warning("upstream %s on step %d (attempt %d/3) — resampling",
+                        r.status_code, step, attempt + 1)
+            await asyncio.sleep(0.5 * (attempt + 1))
         r.raise_for_status()
         last = r.json()
         msg = ((last.get("choices") or [{}])[0].get("message") or {})
