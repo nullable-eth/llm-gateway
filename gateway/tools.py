@@ -161,7 +161,7 @@ async def get_context(message_uuid: str, radius: int = 3) -> str:
         return f"memory unavailable: {exc}"
 
 
-async def search_memory(query: str, k: int = 0) -> str:
+async def search_memory(query: str, k: int = 0, sender: str = "") -> str:
     """Search the archive, and return MANY shallow hits rather than few deep ones.
 
     Measured against the live archive on 14 Sep, with the operator's own "the
@@ -178,17 +178,19 @@ async def search_memory(query: str, k: int = 0) -> str:
     the two that matter.
 
     Only 4 of 50 hits on that query were the operator speaking; the rest were
-    the assistant, including the agent's own past reports on this same alert.
-    That is the next thing to fix, and it is a filter agentmemory does not have
-    yet.
+    the assistant, including the agent's own past reports on this same alert --
+    hence `sender`, which asks agentmemory for one speaker's messages only. That
+    is how you ask for a DECISION rather than a discussion about one.
     """
     if not config.MEMORY_URL:
         return "memory service is not configured (MEMORY_URL unset)"
     k = k or config.MEMORY_SEARCH_K
     try:
         async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get(f"{config.MEMORY_URL}/search",
-                            params={"q": query, "k": min(k, config.MEMORY_SEARCH_MAX_K)},
+            params = {"q": query, "k": min(k, config.MEMORY_SEARCH_MAX_K)}
+            if sender:
+                params["sender"] = sender
+            r = await c.get(f"{config.MEMORY_URL}/search", params=params,
                             headers={"Authorization": f"Bearer {config.MEMORY_TOKEN}"})
         hits = (r.json() or {}).get("hits")
         if hits is None:
@@ -291,7 +293,8 @@ TOOLS = [
             "required": ["summary"]}}},
     {"type": "function", "function": {"name": "search_memory",
         "description": "Search the operator's long-term conversation archive for prior incidents, decisions and known fixes. Returns one line per hit, each with a message_uuid; call get_context on a uuid to read around it rather than searching again. The [sender] tag says who spoke — an operator DECISION is usually what you want, and it will be in their words, not the assistant's. Phrase the query the way they would have said it and include their decision vocabulary: ignore, expected, known, on purpose, leave it, waiting on.",
-        "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "k": {"type": "integer"}},
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "k": {"type": "integer"},
+            "sender": {"type": "string", "description": "restrict to one speaker: 'User' for what the operator themselves said — use this when you need a DECISION, such as whether they have already said to ignore something — or 'Claude' for assistant messages. Omit for everything. Older imported transcripts carry no speaker and drop out when this is set, so try it as well as, not instead of, an unfiltered search."}},
             "required": ["query"]}}},
     {"type": "function", "function": {"name": "get_context",
         "description": "Read the archived conversation surrounding a search_memory hit, verbatim. Use the message_uuid from a hit; radius is how many messages either side.",
@@ -365,7 +368,8 @@ async def _dispatch(name: str, args: dict) -> str:
         return await ha_call_service(args.get("domain", ""), args.get("service", ""),
                                      args.get("entity_id", ""), args.get("data"))
     if name == "search_memory":
-        return await search_memory(args.get("query", ""), int(args.get("k", 6) or 6))
+        return await search_memory(args.get("query", ""), int(args.get("k", 0) or 0),
+                                   str(args.get("sender") or ""))
     if name == "get_context":
         return await get_context(args.get("message_uuid", ""),
                                  int(args.get("radius", 3) or 3))
