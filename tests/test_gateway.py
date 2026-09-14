@@ -567,6 +567,17 @@ async def run_all():
     # attention. Every guard here is load-bearing — a silence that is too broad,
     # unexplained, or longer than its reason is worse than the alert.
     check("silencing is offered", "silence_alert" in names, str(sorted(names)))
+
+    # An empty finish() is not an answer. A phone client asked a question, the
+    # model ran kubectl, then ended its turn with nothing in the report and the
+    # caller got the literal string "(no summary given)".
+    import gateway.agentloop as gloop
+    check("a finish with a summary renders it",
+          gloop._render_finish({"summary": "it was DNS"}) == "it was DNS")
+    check("an empty finish is recognised as saying nothing",
+          gloop._render_finish({}) == gloop.NOTHING_SAID, gloop._render_finish({}))
+    check("and so is one with only blank fields",
+          gloop._render_finish({"summary": "   ", "actions_taken": []}) == gloop.NOTHING_SAID)
     real_am, gcfg.ALERTMANAGER_URL = gcfg.ALERTMANAGER_URL, "http://am.test:9093"
     real_mode = gcfg.MODE
     try:

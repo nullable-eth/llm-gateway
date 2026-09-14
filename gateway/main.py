@@ -28,6 +28,12 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger("capture")
 
 CHAT_PATH = "/v1/chat/completions"
+# llama.cpp serves the un-versioned alias too, and plenty of clients use it —
+# a phone app configured with the bare host was posting to /chat/completions and
+# getting a raw passthrough: no tools, no compaction, and no capture. That last
+# one matters most: "there is no path to the model that is not captured" was
+# only true of the path we happened to name.
+CHAT_PATHS = (CHAT_PATH, "/chat/completions")
 # Generation endpoints with no capture adapter. Nothing here uses them; the
 # counter exists so that stays true observably rather than by assumption.
 UNADAPTED = {"/v1/completions", "/completions", "/completion", "/infill"}
@@ -192,7 +198,7 @@ async def proxy(path: str, request: Request):
 
     started = store.now_iso()
     parsed = None
-    if endpoint == CHAT_PATH and request.method == "POST":
+    if endpoint in CHAT_PATHS and request.method == "POST":
         client_name = (request.headers.get(config.HDR_CLIENT) or "").strip()
         if client_name in config.NOLOG_CLIENTS:
             # Identified machine traffic: proxied exactly like anything else,

@@ -35,6 +35,9 @@ def _args_of(call: dict) -> dict:
         return {}
 
 
+NOTHING_SAID = "(no summary given)"
+
+
 def _render_finish(args: dict) -> str:
     out = [str(args.get("summary") or "").strip()]
     for label, key in (("Actions taken", "actions_taken"), ("Proposals", "proposals")):
@@ -43,7 +46,7 @@ def _render_finish(args: dict) -> str:
             items = [items]
         if items:
             out.append(f"**{label}**\n" + "\n".join(f"- {i}" for i in items))
-    return "\n\n".join(x for x in out if x) or "(no summary given)"
+    return "\n\n".join(x for x in out if x) or NOTHING_SAID
 
 
 async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[dict, list]:
@@ -111,14 +114,31 @@ async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[
 
         # finish() ends the run. Its fields become the answer, so a caller
         # whose prompt asks for a structured report gets one.
+        empty_finish = False
         for call in calls:
             if ((call.get("function") or {}).get("name")) == "finish":
                 report = _render_finish(_args_of(call))
+                if report == NOTHING_SAID:
+                    # finish() with nothing in it is not an answer, and handing
+                    # the caller "(no summary given)" is worse than useless — a
+                    # chat client asked a question, the model ran kubectl to find
+                    # out, and then ended its turn with an empty report. So treat
+                    # it as a turn that has NOT finished: say so, withdraw the
+                    # tools, and make it answer from what it already gathered.
+                    log.info("agentloop: finish() carried no summary; forcing an answer")
+                    messages.append({"role": "tool", "tool_call_id": call.get("id") or "",
+                                     "content": "finish() needs a summary. Answer the question "
+                                                "directly, in prose, from what you already have."})
+                    empty_finish = True
+                    break
                 assistant["content"] = report
                 assistant.pop("tool_calls", None)
                 last.setdefault("choices", [{}])[0]["message"] = dict(assistant)
                 last["choices"][0]["finish_reason"] = "stop"
                 return last, messages
+        if empty_finish:
+            deadline = 0.0          # spent: the next step is tool-free by definition
+            continue
 
         for call in calls:
             name = (call.get("function") or {}).get("name") or ""
