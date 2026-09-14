@@ -18,6 +18,7 @@ gateway took it over.
 import asyncio
 import json
 import logging
+import random
 import time
 
 from . import config, tools
@@ -103,13 +104,28 @@ async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[
         # directly; nothing did after the loop moved here, so one bad sample
         # became a 502 in a phone client's face and a 30-second backoff in the
         # agent's. Retried here, where the bad sample actually happens.
+        attempt_body = call_body
         for attempt in range(3):
-            r = await client.post(f"{upstream}/v1/chat/completions", json=call_body,
+            r = await client.post(f"{upstream}/v1/chat/completions", json=attempt_body,
                                   headers=headers, timeout=budget)
             if r.status_code < 500 or attempt == 2:
                 break
-            log.warning("upstream %s on step %d (attempt %d/3) — resampling",
-                        r.status_code, step, attempt + 1)
+            log.warning("upstream %s on step %d (attempt %d/3): %s",
+                        r.status_code, step, attempt + 1, r.text[:160].replace("\n", " "))
+            attempt_body = dict(call_body)
+            if attempt == 0:
+                # A retry of an identical request is not a resample: sampling is
+                # deterministic enough that the same broken tool call comes back
+                # verbatim, which is exactly what happened -- three attempts,
+                # three identical `"1e4` truncations. Move the sampler.
+                attempt_body["seed"] = random.randint(1, 2 ** 31 - 1)
+                attempt_body["temperature"] = max(0.7, float(call_body.get("temperature") or 0))
+            else:
+                # Still broken: the tools are what it keeps malforming, so take
+                # them away. A plain answer beats a 502 in someone's chat client.
+                attempt_body.pop("tools", None)
+                attempt_body["messages"] = messages + [{"role": "user", "content":
+                    "Answer directly, in prose, without calling any tool."}]
             await asyncio.sleep(0.5 * (attempt + 1))
         r.raise_for_status()
         last = r.json()
