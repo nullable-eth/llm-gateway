@@ -236,6 +236,17 @@ async def proxy(path: str, request: Request):
             final, produced = await agentloop.run(
                 client, config.UPSTREAM, loop_body, auth,
                 request.app.state.compactor)
+        except httpx.TimeoutException as e:
+            # 504, never 502. The distinction is the caller's whole retry
+            # policy: 502 means "the brain is not there", which is a model
+            # rollout and is worth waiting out, while this means "it is there
+            # and still thinking", where a retry only starts a second identical
+            # loop competing with the first for the same llama.cpp slots.
+            # Reported as 502 once, this produced exactly that storm.
+            metrics.UPSTREAM_ERRORS.labels(endpoint=endpoint).inc()
+            log.warning("agentloop timed out: %s", e)
+            return JSONResponse({"error": {"message": f"agent loop timed out: {e}",
+                                           "type": "gateway_timeout"}}, status_code=504)
         except Exception as e:
             metrics.UPSTREAM_ERRORS.labels(endpoint=endpoint).inc()
             log.exception("agentloop failed")

@@ -59,7 +59,13 @@ async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[
         # Tools are withdrawn on the last step, or once the wall-clock budget
         # is spent, so the model has to answer rather than start work nobody
         # will wait for.
-        out_of_time = time.monotonic() >= deadline
+        # Out of time means either budget: the tool budget, or so little left
+        # against the hard deadline that another tool step could only be given a
+        # stub of a timeout and die in the middle. Answering is always the
+        # better use of the last seconds than a step that cannot finish.
+        now = time.monotonic()
+        remaining = hard_deadline - now
+        out_of_time = now >= deadline or remaining < config.UPSTREAM_MIN_TIMEOUT_S
         offer_tools = step < config.TOOL_MAX_STEPS - 1 and not out_of_time
         if out_of_time and step:
             log.info("agentloop: time budget spent after %d step(s); "
@@ -79,7 +85,13 @@ async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[
         # Never timeout=None: an unbounded call outlives the caller, which then
         # abandons the request and retries, and the retry competes with the loop
         # it just abandoned for the same llama.cpp slots.
-        budget = max(config.UPSTREAM_MIN_TIMEOUT_S, hard_deadline - time.monotonic())
+        #
+        # The answer gets its OWN budget rather than the remainder, because the
+        # remainder is smallest exactly when the answer matters most — a run
+        # that spent its time gathering evidence would otherwise be given ten
+        # seconds to say what it found, time out, and report nothing at all.
+        budget = (max(config.UPSTREAM_MIN_TIMEOUT_S, hard_deadline - time.monotonic())
+                  if offer_tools else config.ANSWER_TIMEOUT_S)
         r = await client.post(f"{upstream}/v1/chat/completions", json=call_body,
                               headers=headers, timeout=budget)
         r.raise_for_status()

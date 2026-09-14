@@ -110,6 +110,10 @@ TOOL_MAX_SECONDS = int(os.environ.get("TOOL_MAX_SECONDS", "180"))
 # instead of racing it.
 REQUEST_MAX_SECONDS = int(os.environ.get("REQUEST_MAX_SECONDS", "240"))
 UPSTREAM_MIN_TIMEOUT_S = int(os.environ.get("UPSTREAM_MIN_TIMEOUT_S", "30"))
+# The final answer's own budget, on top of the deadline above rather than
+# inside it. Worst case per request is therefore ~REQUEST_MAX + ANSWER_TIMEOUT,
+# which must stay under the caller's timeout (cluster-agent: 420s).
+ANSWER_TIMEOUT_S = int(os.environ.get("ANSWER_TIMEOUT_S", "150"))
 TOOL_OUTPUT_MAX = int(os.environ.get("TOOL_OUTPUT_MAX", "8000"))
 KUBECTL_TIMEOUT_S = int(os.environ.get("KUBECTL_TIMEOUT_S", "60"))
 # Guidance injected with the tools. The client never asked for the tools and
