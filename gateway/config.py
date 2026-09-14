@@ -148,3 +148,8 @@ SILENCE_MAX_HOURS = int(os.environ.get("SILENCE_MAX_HOURS", "720"))
 # minutes later is not visibility, and a run that dies mid-way would take its
 # only record with it. Empty means mutations are logged but not posted.
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
+# Preferred over the webhook when set: with the bot token, an action can be
+# announced INSIDE the incident thread the caller is working in (it passes the
+# thread id in X-Discord-Thread), so the change and the alert that caused it sit
+# in one place instead of two channels nobody reads together.
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")

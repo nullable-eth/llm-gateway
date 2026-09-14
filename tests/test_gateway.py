@@ -603,6 +603,31 @@ async def run_all():
     check("a rollout restart is an action",
           gtools.is_mutation("run_kubectl", {"args": ["rollout", "restart", "deploy/x"]}))
     check("silencing is an action", gtools.is_mutation("silence_alert", {}))
+
+    # Where an action is announced: the incident thread when the caller names
+    # one, the webhook otherwise. Getting this wrong means the operator reads
+    # "I deleted a pod" in a channel with no alert attached to it.
+    posted: list[tuple] = []
+    class _FakeC:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, **kw): posted.append((url, kw.get("json", {}).get("content", "")))
+    real_httpx, gtools.httpx.AsyncClient = gtools.httpx.AsyncClient, _FakeC
+    real_tok, gcfg.DISCORD_BOT_TOKEN = gcfg.DISCORD_BOT_TOKEN, "tok"
+    real_hook, gcfg.DISCORD_WEBHOOK = gcfg.DISCORD_WEBHOOK, "https://hook.test/x"
+    try:
+        gtools.ANNOUNCE_TO.set("998877")
+        await gtools.announce("did a thing")
+        check("with a thread, the action lands in that thread",
+              posted and "/channels/998877/messages" in posted[-1][0], str(posted[-1:]))
+        gtools.ANNOUNCE_TO.set("")
+        await gtools.announce("did a thing")
+        check("without one, it falls back to the webhook",
+              posted[-1][0] == "https://hook.test/x", str(posted[-1:]))
+    finally:
+        gtools.httpx.AsyncClient = real_httpx
+        gcfg.DISCORD_BOT_TOKEN, gcfg.DISCORD_WEBHOOK = real_tok, real_hook
     said: list[str] = []
     async def _say(t): said.append(t)
     real_say, gtools.announce = gtools.announce, _say

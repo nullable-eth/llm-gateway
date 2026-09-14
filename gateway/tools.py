@@ -24,6 +24,7 @@ tool credential is the intended next step — the blocker is that chat clients
 header, so the credential would have to ride the model name or a second port.
 """
 import asyncio
+import contextvars
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -328,14 +329,27 @@ def is_mutation(name: str, args: dict) -> bool:
     return False
 
 
+# Set per request from X-Discord-Thread. A ContextVar rather than a parameter
+# because the thread belongs to the REQUEST, and threading it through the loop,
+# the dispatcher and every tool signature would put Discord in the type of code
+# that should not know Discord exists.
+ANNOUNCE_TO: contextvars.ContextVar[str] = contextvars.ContextVar("announce_to", default="")
+
+
 async def announce(text: str) -> None:
     """Post an action to Discord. Never raises, never blocks the tool."""
     log.info("ACTION %s", text.replace("\n", " ")[:400])
-    if not config.DISCORD_WEBHOOK:
-        return
+    thread = ANNOUNCE_TO.get()
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            await c.post(config.DISCORD_WEBHOOK, json={"content": text[:1900]})
+            if thread and config.DISCORD_BOT_TOKEN:
+                await c.post(f"https://discord.com/api/v10/channels/{thread}/messages",
+                             headers={"Authorization": f"Bot {config.DISCORD_BOT_TOKEN}",
+                                      "User-Agent": "llm-gateway (actions, 1.0)"},
+                             json={"content": text[:1900],
+                                   "allowed_mentions": {"parse": []}})
+            elif config.DISCORD_WEBHOOK:
+                await c.post(config.DISCORD_WEBHOOK, json={"content": text[:1900]})
     except Exception as exc:
         log.warning("action post failed (continuing): %s", exc)
 

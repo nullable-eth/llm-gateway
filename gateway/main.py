@@ -19,7 +19,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from prometheus_client import generate_latest
 
-from . import agentloop, compact, config, forward, metrics, policy
+from . import agentloop, compact, config, forward, metrics, policy, tools
 from .capture import normalize, sse, store
 from .capture.writer import Writer
 
@@ -232,6 +232,10 @@ async def proxy(path: str, request: Request):
         loop_body = dict(new_body or parsed)
         loop_body["messages"] = policy.apply(loop_body.get("messages") or [])
         sent = list(loop_body["messages"])
+        # Where this request's mutations get announced. cluster-agent sends the
+        # incident thread it is working in; a chat client sends nothing and the
+        # announcements fall back to the webhook (or to logs alone).
+        tools.ANNOUNCE_TO.set(request.headers.get("x-discord-thread", "") or "")
         try:
             final, produced = await agentloop.run(
                 client, config.UPSTREAM, loop_body, auth,
