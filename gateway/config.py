@@ -132,6 +132,12 @@ HA_URL = os.environ.get("HA_URL", "").rstrip("/")
 HA_TOKEN = os.environ.get("HA_TOKEN", "")
 MEMORY_URL = os.environ.get("MEMORY_URL", "").rstrip("/")
 MEMORY_TOKEN = os.environ.get("MEMORY_TOKEN", "")
+# How many hits a memory search returns. Was effectively 6-8, which measured out
+# as "the operator said it, at rank 12, and nobody looked past 8". Hits render
+# one line each now, so a large k costs little and buys the tail of the ranking,
+# which is where a decision from months ago actually sits.
+MEMORY_SEARCH_K = int(os.environ.get("MEMORY_SEARCH_K", "25"))
+MEMORY_SEARCH_MAX_K = int(os.environ.get("MEMORY_SEARCH_MAX_K", "50"))
 # Alertmanager's own API, for silencing an alert the operator has already said
 # to ignore. Empty disables the tool. The cap is what keeps a silence from
 # outliving its reason: 30 days, and the default is a week.

@@ -161,15 +161,52 @@ async def get_context(message_uuid: str, radius: int = 3) -> str:
         return f"memory unavailable: {exc}"
 
 
-async def search_memory(query: str, k: int = 6) -> str:
+async def search_memory(query: str, k: int = 0) -> str:
+    """Search the archive, and return MANY shallow hits rather than few deep ones.
+
+    Measured against the live archive on 14 Sep, with the operator's own "the
+    bond failure is because I moved an ethernet cable ... ignore this for now"
+    as the target. At k=8 -- the old default -- the agent's own phrasing put that
+    line at rank 12 and rank 15: present, retrievable, and four places past where
+    anyone looked. It reported "I searched and found none" and re-diagnosed a
+    known-accepted state for the second day running.
+
+    So: a much larger k, and each hit rendered compactly instead of raw JSON
+    truncated at TOOL_OUTPUT_MAX. Raw JSON was the reason a big k could not help
+    -- 25 hits of it overflow the budget and get cut off exactly where the late
+    ranks live. One line per hit fits ~40 of them, and get_context is there for
+    the two that matter.
+
+    Only 4 of 50 hits on that query were the operator speaking; the rest were
+    the assistant, including the agent's own past reports on this same alert.
+    That is the next thing to fix, and it is a filter agentmemory does not have
+    yet.
+    """
     if not config.MEMORY_URL:
         return "memory service is not configured (MEMORY_URL unset)"
+    k = k or config.MEMORY_SEARCH_K
     try:
         async with httpx.AsyncClient(timeout=20) as c:
             r = await c.get(f"{config.MEMORY_URL}/search",
-                            params={"q": query, "k": k},
+                            params={"q": query, "k": min(k, config.MEMORY_SEARCH_MAX_K)},
                             headers={"Authorization": f"Bearer {config.MEMORY_TOKEN}"})
-        return r.text[:config.TOOL_OUTPUT_MAX]
+        hits = (r.json() or {}).get("hits")
+        if hits is None:
+            return r.text[:config.TOOL_OUTPUT_MAX]
+        if not hits:
+            return f"no hits for {query!r}"
+        lines = [f"{len(hits)} hit(s), best first. Call get_context on a "
+                 f"message_uuid to read around one."]
+        for h in hits:
+            who = h.get("sender") or "?"
+            # 180, not 240: measured, 25 hits at 240 came to 7937 chars against
+            # a TOOL_OUTPUT_MAX of 8000, and being truncated at the cap loses
+            # the tail of the ranking — which is the exact failure this is
+            # fixing. Headroom is the point.
+            snip = " ".join((h.get("snippet") or "").split())[:180]
+            lines.append(f"- [{who}] {h.get('date') or ''} {h.get('title') or ''} "
+                         f"(uuid {h.get('message_uuid')}): {snip}")
+        return "\n".join(lines)[:config.TOOL_OUTPUT_MAX]
     except Exception as exc:          # optional context, never fatal
         return f"memory unavailable: {exc}"
 
@@ -253,7 +290,7 @@ TOOLS = [
                 "description": "mutations a human should run or approve, exact commands"}},
             "required": ["summary"]}}},
     {"type": "function", "function": {"name": "search_memory",
-        "description": "Search the operator's long-term conversation archive for prior incidents, decisions and known fixes. Returns scored snippets, each with a message_uuid. When a snippet is not enough, call get_context on its message_uuid rather than searching again.",
+        "description": "Search the operator's long-term conversation archive for prior incidents, decisions and known fixes. Returns one line per hit, each with a message_uuid; call get_context on a uuid to read around it rather than searching again. The [sender] tag says who spoke — an operator DECISION is usually what you want, and it will be in their words, not the assistant's. Phrase the query the way they would have said it and include their decision vocabulary: ignore, expected, known, on purpose, leave it, waiting on.",
         "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "k": {"type": "integer"}},
             "required": ["query"]}}},
     {"type": "function", "function": {"name": "get_context",
