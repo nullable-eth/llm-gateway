@@ -26,6 +26,7 @@ header, so the credential would have to ride the model name or a second port.
 import asyncio
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 import subprocess
 
 import httpx
@@ -142,6 +143,60 @@ async def search_memory(query: str, k: int = 6) -> str:
         return f"memory unavailable: {exc}"
 
 
+async def silence_alert(alertname: str, comment: str, hours: int = 168,
+                        matchers: dict | None = None) -> str:
+    """Stop an alert notifying, when the operator has already said to ignore it.
+
+    Without this the only thing the agent could do with "ignore the bond, I
+    moved the cable" was write it in a report and then investigate the same
+    alert again six hours later, forever. A silence is the one mutation that
+    makes a known-accepted state stop costing attention.
+
+    Bounded on purpose: an alertname is required (a silence with only a node or
+    namespace matcher swallows unrelated incidents), a comment is required and
+    should say who decided and where that is recorded, and the duration is
+    capped — a silence that outlives the reason for it is how an outage goes
+    unnoticed.
+    """
+    if not config.ALERTMANAGER_URL:
+        return "alertmanager is not configured (ALERTMANAGER_URL unset)"
+    if not alertname.strip():
+        return "REFUSED: alertname is required — a silence without one is too broad"
+    if len(comment.strip()) < 15:
+        return ("REFUSED: comment must say why this is being silenced and where "
+                "the operator said so (cite the search_memory hit)")
+    hours = max(1, min(int(hours or 168), config.SILENCE_MAX_HOURS))
+    spec = [{"name": "alertname", "value": alertname, "isRegex": False, "isEqual": True}]
+    for k, v in (matchers or {}).items():
+        spec.append({"name": str(k), "value": str(v), "isRegex": False, "isEqual": True})
+    if config.MODE != "auto":
+        return (f"PROPOSAL RECORDED (propose mode): silence {spec} for {hours}h "
+                f"— {comment}")
+    now = datetime.now(timezone.utc)
+    body = {"matchers": spec,
+            "startsAt": now.isoformat(),
+            "endsAt": (now + timedelta(hours=hours)).isoformat(),
+            "createdBy": "cluster-agent",
+            "comment": comment}
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            existing = await c.get(f"{config.ALERTMANAGER_URL}/api/v2/silences")
+            for s in (existing.json() if existing.status_code == 200 else []):
+                if s.get("status", {}).get("state") != "active":
+                    continue
+                if {(m["name"], m["value"]) for m in s.get("matchers", [])} == \
+                   {(m["name"], m["value"]) for m in spec}:
+                    return (f"already silenced until {s.get('endsAt')} "
+                            f"(id {s.get('id')}); nothing to do")
+            r = await c.post(f"{config.ALERTMANAGER_URL}/api/v2/silences", json=body)
+        if r.status_code >= 300:
+            return f"silence failed: HTTP {r.status_code}: {r.text[:500]}"
+        return (f"silenced {spec} for {hours}h (id "
+                f"{r.json().get('silenceID', '?')}): {comment}")
+    except Exception as exc:
+        return f"silence failed: {exc}"
+
+
 TOOLS = [
     {"type": "function", "function": {"name": "run_kubectl",
         "description": "Run a guarded kubectl command against this cluster. Read verbs always allowed; mutations only per policy.",
@@ -174,10 +229,66 @@ TOOLS = [
         "description": "Read the archived conversation surrounding a search_memory hit, verbatim. Use the message_uuid from a hit; radius is how many messages either side.",
         "parameters": {"type": "object", "properties": {"message_uuid": {"type": "string"}, "radius": {"type": "integer"}},
             "required": ["message_uuid"]}}},
+    {"type": "function", "function": {"name": "silence_alert",
+        "description": "Stop an alert from notifying, for a bounded time. Use this ONLY when the operator has already said this state is known and should be ignored — quote that in the comment and cite the search_memory hit it came from. Never silence something you merely judged unimportant yourself; say so in the report and let a human decide.",
+        "parameters": {"type": "object", "properties": {
+            "alertname": {"type": "string", "description": "exact alertname to silence; required"},
+            "comment": {"type": "string", "description": "why, in the operator's own words, and where they said it"},
+            "hours": {"type": "integer", "description": "duration; default 168 (7 days)"},
+            "matchers": {"type": "object", "description": "extra exact label matchers, e.g. {\"instance\":\"192.168.1.12\"}, to keep the silence narrow"}},
+            "required": ["alertname", "comment"]}}},
 ]
 
 
+def is_mutation(name: str, args: dict) -> bool:
+    """Does this call change something outside this process?
+
+    Asked of every dispatch rather than maintained as a list of "dangerous
+    tools", so a tool added later is announced by default instead of being
+    silently exempt until someone remembers to add it here.
+    """
+    if name in ("ha_call_service", "silence_alert"):
+        return True
+    if name == "run_kubectl":
+        argv = [str(a).lower() for a in (args.get("args") or [])]
+        if not argv:
+            return False
+        return argv[0] not in READ_VERBS or argv[:2] == ["rollout", "restart"]
+    return False
+
+
+async def announce(text: str) -> None:
+    """Post an action to Discord. Never raises, never blocks the tool."""
+    log.info("ACTION %s", text.replace("\n", " ")[:400])
+    if not config.DISCORD_WEBHOOK:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            await c.post(config.DISCORD_WEBHOOK, json={"content": text[:1900]})
+    except Exception as exc:
+        log.warning("action post failed (continuing): %s", exc)
+
+
 async def dispatch(name: str, args: dict) -> str:
+    """Every mutation announces itself here, before and after.
+
+    Before, because a run that dies mid-change must still leave a record of what
+    it started; after, because "I ran this" and "this is what happened" are
+    different facts and the second one is the one worth reading. Refusals and
+    proposals are announced too: "the agent tried to do X and was stopped" is
+    exactly as interesting as "the agent did X".
+    """
+    mutating = is_mutation(name, args)
+    if mutating:
+        await announce(f"**[cluster-agent] action** `{name}` {json.dumps(args)[:400]}")
+    out = await _dispatch(name, args)
+    if mutating:
+        head = out.strip().splitlines()[0] if out.strip() else "(no output)"
+        await announce(f"**[cluster-agent] result** `{name}` -> {head[:400]}")
+    return out
+
+
+async def _dispatch(name: str, args: dict) -> str:
     if name == "run_kubectl":
         return await asyncio.to_thread(run_kubectl, args.get("args", []))
     if name == "ha_get_states":
@@ -190,4 +301,8 @@ async def dispatch(name: str, args: dict) -> str:
     if name == "get_context":
         return await get_context(args.get("message_uuid", ""),
                                  int(args.get("radius", 3) or 3))
+    if name == "silence_alert":
+        return await silence_alert(args.get("alertname", ""), args.get("comment", ""),
+                                   int(args.get("hours", 168) or 168),
+                                   args.get("matchers"))
     return f"REFUSED: unknown tool '{name}'"

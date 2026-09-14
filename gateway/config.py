@@ -101,6 +101,15 @@ TOOL_MAX_STEPS = int(os.environ.get("TOOL_MAX_STEPS", "8"))
 # reports nothing. Past this the tools are withdrawn and the model must answer,
 # leaving the remainder of the caller's patience for that final reply.
 TOOL_MAX_SECONDS = int(os.environ.get("TOOL_MAX_SECONDS", "180"))
+# ...and a hard ceiling on the whole request, because withdrawing the tools does
+# not bound anything on its own: the final generation was issued with no timeout
+# at all, so a loop could and did run past the caller's patience and get
+# abandoned mid-answer. Every upstream call now gets the time remaining against
+# this deadline (never less than the floor), so the request either answers
+# inside REQUEST_MAX_SECONDS or fails as a timeout the caller can report,
+# instead of racing it.
+REQUEST_MAX_SECONDS = int(os.environ.get("REQUEST_MAX_SECONDS", "240"))
+UPSTREAM_MIN_TIMEOUT_S = int(os.environ.get("UPSTREAM_MIN_TIMEOUT_S", "30"))
 TOOL_OUTPUT_MAX = int(os.environ.get("TOOL_OUTPUT_MAX", "8000"))
 KUBECTL_TIMEOUT_S = int(os.environ.get("KUBECTL_TIMEOUT_S", "60"))
 # Guidance injected with the tools. The client never asked for the tools and
@@ -119,3 +128,13 @@ HA_URL = os.environ.get("HA_URL", "").rstrip("/")
 HA_TOKEN = os.environ.get("HA_TOKEN", "")
 MEMORY_URL = os.environ.get("MEMORY_URL", "").rstrip("/")
 MEMORY_TOKEN = os.environ.get("MEMORY_TOKEN", "")
+# Alertmanager's own API, for silencing an alert the operator has already said
+# to ignore. Empty disables the tool. The cap is what keeps a silence from
+# outliving its reason: 30 days, and the default is a week.
+ALERTMANAGER_URL = os.environ.get("ALERTMANAGER_URL", "").rstrip("/")
+SILENCE_MAX_HOURS = int(os.environ.get("SILENCE_MAX_HOURS", "720"))
+# Where every mutation announces itself, as it happens. The condition on the
+# agent being allowed to change anything is that the change is visible: a report
+# minutes later is not visibility, and a run that dies mid-way would take its
+# only record with it. Empty means mutations are logged but not posted.
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")

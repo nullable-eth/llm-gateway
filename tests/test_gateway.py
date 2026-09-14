@@ -535,12 +535,60 @@ async def run_all():
     names = {t["function"]["name"] for t in gtools.TOOLS}
     check("memory search and context are both offered, not just search",
           {"search_memory", "get_context"} <= names, str(sorted(names)))
+
+    # silence_alert: the mutation that lets a known-accepted alert stop costing
+    # attention. Every guard here is load-bearing — a silence that is too broad,
+    # unexplained, or longer than its reason is worse than the alert.
+    check("silencing is offered", "silence_alert" in names, str(sorted(names)))
+    real_am, gcfg.ALERTMANAGER_URL = gcfg.ALERTMANAGER_URL, "http://am.test:9093"
+    real_mode = gcfg.MODE
+    try:
+        check("a silence without an alertname is refused as too broad",
+              (await gtools.silence_alert("", "operator said ignore it, cable moved"))
+              .startswith("REFUSED"))
+        check("a silence with no real reason is refused",
+              (await gtools.silence_alert("NodeBondingDegraded", "known"))
+              .startswith("REFUSED"))
+        gcfg.MODE = "propose"
+        out = await gtools.silence_alert("NodeBondingDegraded",
+                                         "operator moved the cable; restoring when new "
+                                         "cable is run", 168, {"instance": "192.168.1.12"})
+        check("in propose mode it is recorded, not sent", out.startswith("PROPOSAL RECORDED"))
+        check("and the proposal keeps the extra matcher, so the silence stays narrow",
+              "192.168.1.12" in out, out)
+        gcfg.SILENCE_MAX_HOURS = 720
+        out = await gtools.silence_alert("X", "operator said to ignore this one", 99999)
+        check("duration is capped rather than honoured", "720h" in out, out)
+    finally:
+        gcfg.ALERTMANAGER_URL, gcfg.MODE = real_am, real_mode
     check("search's description points at get_context rather than re-searching",
           "get_context" in [t["function"]["description"]
                             for t in gtools.TOOLS
                             if t["function"]["name"] == "search_memory"][0])
     check("an unknown tool is refused, not crashed on",
           (await gtools.dispatch("nope", {})).startswith("REFUSED"))
+
+    # Nothing changes without the channel hearing about it. This is the
+    # condition the agent is allowed to act under, so it is tested, not trusted.
+    check("a read is not an action", not gtools.is_mutation("run_kubectl", {"args": ["get", "pods"]}))
+    check("memory search is not an action", not gtools.is_mutation("search_memory", {"query": "x"}))
+    check("deleting a pod is an action", gtools.is_mutation("run_kubectl", {"args": ["delete", "pod", "p"]}))
+    check("a rollout restart is an action",
+          gtools.is_mutation("run_kubectl", {"args": ["rollout", "restart", "deploy/x"]}))
+    check("silencing is an action", gtools.is_mutation("silence_alert", {}))
+    said: list[str] = []
+    async def _say(t): said.append(t)
+    real_say, gtools.announce = gtools.announce, _say
+    try:
+        await gtools.dispatch("run_kubectl", {"args": ["get", "pods", "-n", "ai"]})
+        check("a read announces nothing", said == [], str(said))
+        await gtools.dispatch("run_kubectl", {"args": ["delete", "pod", "nope-does-not-exist"]})
+        check("a mutation announces before and after", len(said) == 2, str(said))
+        check("the attempt is announced even when it is refused",
+              said and "action" in said[0] and "delete" in said[0], str(said))
+        check("and the outcome is announced separately", said and "result" in said[-1], str(said))
+    finally:
+        gtools.announce = real_say
     async def _fake_ctx(u, r=3):
         return f"WINDOW around {u} radius {r}"
     real_ctx, gtools.get_context = gtools.get_context, _fake_ctx

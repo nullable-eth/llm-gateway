@@ -51,7 +51,9 @@ async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[
     messages = list(body.get("messages") or [])
     headers = {"Authorization": auth} if auth else {}
     last = None
-    deadline = time.monotonic() + config.TOOL_MAX_SECONDS
+    started = time.monotonic()
+    deadline = started + config.TOOL_MAX_SECONDS
+    hard_deadline = started + config.REQUEST_MAX_SECONDS
 
     for step in range(config.TOOL_MAX_STEPS):
         # Tools are withdrawn on the last step, or once the wall-clock budget
@@ -74,8 +76,12 @@ async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[
                 "have, and say plainly what you could not determine."}]
             call_body["messages"] = messages
 
+        # Never timeout=None: an unbounded call outlives the caller, which then
+        # abandons the request and retries, and the retry competes with the loop
+        # it just abandoned for the same llama.cpp slots.
+        budget = max(config.UPSTREAM_MIN_TIMEOUT_S, hard_deadline - time.monotonic())
         r = await client.post(f"{upstream}/v1/chat/completions", json=call_body,
-                              headers=headers, timeout=None)
+                              headers=headers, timeout=budget)
         r.raise_for_status()
         last = r.json()
         msg = ((last.get("choices") or [{}])[0].get("message") or {})
