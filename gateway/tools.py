@@ -36,11 +36,36 @@ from . import config
 log = logging.getLogger("gateway")
 
 READ_VERBS = {"get", "describe", "logs", "top", "api-resources", "api-versions",
-              "explain", "version", "cluster-info", "rollout"}
-DENY = {"secret", "secrets", "exec", "attach", "cp", "port-forward", "proxy",
-        "edit", "apply", "create", "patch", "replace", "label", "annotate",
-        "cordon", "drain", "taint", "auth", "--token", "--kubeconfig"}
-AUTO_OK = {("delete", "pod"), ("delete", "pods"), ("rollout", "restart")}
+              "explain", "version", "cluster-info", "rollout", "events", "diff",
+              "auth"}  # auth can-i only; see FORBIDDEN_SUBS
+
+# There is no verb allowlist any more. The agent may take any action kubectl can
+# take, because an SRE that can only delete pods and restart deployments cannot
+# actually restore service -- it can only describe what someone else must do.
+# What remains is four structural refusals, and they are not about danger:
+#
+#   1. Nothing that reads credentials. `secrets` is absent from the RBAC as well,
+#      so this is belt and braces rather than the only guard.
+#   2. Nothing that opens a shell or a tunnel into a workload -- exec, attach,
+#      cp, port-forward, proxy, debug. These turn "the agent can act" into "the
+#      agent can be made to do anything the workload can do", which is a much
+#      larger claim than anything a prompt should be able to make.
+#   3. No identity games: --as, --token, --kubeconfig. The agent acts as itself
+#      or not at all, so the audit trail means something.
+#   4. No RBAC edits. Permissions are a GitOps decision, not a runtime one.
+#
+# Everything else -- patch, apply, scale, cordon, drain, taint, delete, annotate
+# -- is allowed in auto mode and recorded as a proposal otherwise. Every one of
+# them announces itself to Discord before and after, which is the actual control.
+FORBIDDEN_VERBS = {"exec", "attach", "cp", "port-forward", "proxy", "debug",
+                   "certificate", "config"}
+FORBIDDEN_SUBS = {"auth": {"can-i", "whoami"}}    # only these subcommands of auth
+FORBIDDEN_TOKENS = {"--token", "--kubeconfig", "--as", "--as-group", "--as-uid"}
+FORBIDDEN_RESOURCES = {"secret", "secrets", "serviceaccount", "serviceaccounts",
+                       "clusterrole", "clusterroles", "role", "roles",
+                       "rolebinding", "rolebindings", "clusterrolebinding",
+                       "clusterrolebindings", "csr", "certificatesigningrequest",
+                       "certificatesigningrequests"}
 
 
 def kubectl_guard(args: list[str]) -> str | None:
@@ -48,23 +73,29 @@ def kubectl_guard(args: list[str]) -> str | None:
     if not args:
         return "empty command"
     low = [a.lower() for a in args]
-    for tok in low:
-        base = tok.split("=")[0]
-        if base in DENY or tok in DENY:
-            return f"'{tok}' is never permitted (read RBAC + GitOps: no direct writes)"
-    for name in config.PROTECTED:
-        if any(name in t for t in low[1:]):
-            if low[0] not in READ_VERBS or low[0:2] == ["rollout", "restart"]:
-                return f"target matches protected component '{name}' — self-preservation rule"
     verb = low[0]
-    if verb in READ_VERBS and low[0:2] != ["rollout", "restart"]:
+    if verb in FORBIDDEN_VERBS:
+        return (f"'{verb}' is never permitted: it opens a shell or tunnel into a "
+                f"workload, which is a bigger claim than any alert justifies")
+    if verb in FORBIDDEN_SUBS and (len(low) < 2 or low[1] not in FORBIDDEN_SUBS[verb]):
+        return f"'{verb}' is only permitted as: {' | '.join(sorted(FORBIDDEN_SUBS[verb]))}"
+    for tok in low:
+        if tok.split("=")[0] in FORBIDDEN_TOKENS:
+            return f"'{tok}' is never permitted: the agent acts as itself or not at all"
+    for tok in low[1:]:
+        # "secrets", "secret/foo", "secrets.v1." -- any spelling that names one.
+        if tok.split("/")[0].split(".")[0] in FORBIDDEN_RESOURCES:
+            return (f"'{tok}' is never permitted: credentials and permissions are "
+                    f"not runtime state (and are absent from this RBAC anyway)")
+    is_read = verb in READ_VERBS and low[0:2] != ["rollout", "restart"]
+    for name in config.PROTECTED:
+        if any(name in t for t in low[1:]) and not is_read:
+            return f"target matches protected component '{name}' — self-preservation rule"
+    if is_read:
         return None
-    pair = (verb, low[1] if len(low) > 1 else "")
-    if pair in AUTO_OK or (verb, "restart") == ("rollout", "restart"):
-        if config.MODE != "auto":
-            return "propose mode: mutation recorded as a proposal, not executed"
-        return None
-    return f"verb '{verb}' is outside the action allowlist"
+    if config.MODE != "auto":
+        return "propose mode: mutation recorded as a proposal, not executed"
+    return None
 
 
 def run_kubectl(args: list[str]) -> str:

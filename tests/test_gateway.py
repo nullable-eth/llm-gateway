@@ -532,6 +532,33 @@ async def run_all():
     check("guard refuses mutations in propose mode",
           gtools.kubectl_guard(["delete", "pod", "something"]) is not None)
 
+    # The action surface is now "anything kubectl can do" minus four structural
+    # refusals. These check the refusals are the ones intended and that ordinary
+    # repair verbs are not among them.
+    check("guard refuses a shell into a workload",
+          gtools.kubectl_guard(["port-forward", "svc/x", "8080"]) is not None)
+    check("guard refuses impersonation",
+          gtools.kubectl_guard(["get", "pods", "--as=system:admin"]) is not None)
+    check("guard refuses touching service accounts",
+          gtools.kubectl_guard(["delete", "serviceaccount", "x"]) is not None)
+    check("guard refuses RBAC edits",
+          gtools.kubectl_guard(["patch", "clusterrolebinding", "x"]) is not None)
+    check("guard refuses a secret by slash spelling",
+          gtools.kubectl_guard(["get", "secret/db-creds"]) is not None)
+    real_mode2, gcfg.MODE = gcfg.MODE, "auto"
+    try:
+        for argv, label in ((["patch", "deployment", "x", "-p", "{}"], "patch"),
+                            (["cordon", "whitehorse-media"], "cordon"),
+                            (["drain", "whitehorse-media", "--ignore-daemonsets"], "drain"),
+                            (["scale", "deploy/x", "--replicas=0"], "scale"),
+                            (["delete", "volumeattachment", "csi-abc"], "delete volumeattachment")):
+            check(f"auto mode allows {label}", gtools.kubectl_guard(argv) is None,
+                  str(gtools.kubectl_guard(argv)))
+        check("but still not into the brain it is thinking with",
+              gtools.kubectl_guard(["scale", "deploy/llm-expert", "--replicas=0"]) is not None)
+    finally:
+        gcfg.MODE = real_mode2
+
     names = {t["function"]["name"] for t in gtools.TOOLS}
     check("memory search and context are both offered, not just search",
           {"search_memory", "get_context"} <= names, str(sorted(names)))
