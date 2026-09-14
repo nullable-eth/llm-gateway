@@ -58,6 +58,7 @@ async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[
     started = time.monotonic()
     deadline = started + config.TOOL_MAX_SECONDS
     hard_deadline = started + config.REQUEST_MAX_SECONDS
+    asked_again = False          # one nudge, for a turn that came back empty
 
     for step in range(config.TOOL_MAX_STEPS):
         # Tools are withdrawn on the last step, or once the wall-clock budget
@@ -123,6 +124,26 @@ async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[
         messages.append(assistant)
 
         if not calls:
+            # An empty message is not an answer either. This model puts its
+            # thinking in reasoning_content and sometimes ends a tool run with
+            # nothing in `content` at all — the phone client got a blank bubble
+            # after the gateway had searched the archive for it. Ask once more
+            # with the tools withdrawn; if it is still empty, hand back the
+            # thinking rather than nothing.
+            if not (msg.get("content") or "").strip():
+                if not asked_again:
+                    asked_again = True
+                    log.info("agentloop: empty answer on step %d; asking again", step)
+                    messages.append({"role": "user", "content":
+                                     "That message was empty. Answer the question now, in prose, "
+                                     "from what you already have."})
+                    deadline = 0.0
+                    continue
+                text = (msg.get("reasoning_content") or "").strip() \
+                    or "(the model returned an empty answer)"
+                last.setdefault("choices", [{}])[0]["message"] = {
+                    "role": "assistant", "content": text}
+                log.warning("agentloop: still empty; returned reasoning/placeholder")
             return last, messages
 
         # finish() ends the run. Its fields become the answer, so a caller
