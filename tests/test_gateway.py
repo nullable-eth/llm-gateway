@@ -141,6 +141,93 @@ async def completions(request: Request):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+# --- a fake GitHub, just the REST calls gittools makes ---------------------
+import hashlib as _hl
+
+GH = {"branches": {}, "commits": {}, "trees": {}, "pulls": [], "calls": []}
+
+
+def _gh_sha(obj) -> str:
+    return _hl.sha1(json.dumps(obj, sort_keys=True).encode()).hexdigest()
+
+
+def gh_reset():
+    files = {"kubernetes/apps/media/sonarr/helmrelease.yaml":
+             "spec:\n  values:\n    resources: { requests: { memory: 512Mi } }\n",
+             "README.md": "hello\n"}
+    t = _gh_sha(files)
+    c = _gh_sha({"tree": t, "parents": []})
+    GH.update(branches={"main": c}, commits={c: {"tree": t, "parents": []}},
+              trees={t: files}, pulls=[], calls=[])
+
+
+@fake.api_route("/gh/{rest:path}", methods=["GET", "POST", "PATCH"])
+async def github(rest: str, request: Request):
+    import base64 as _b64
+    GH["calls"].append((request.method, rest))
+    if request.headers.get("authorization") != "Bearer ghtest":
+        return JSONResponse({"message": "Bad credentials"}, status_code=401)
+    body = await request.json() if request.method != "GET" else {}
+    q = request.query_params
+    if rest == "search/code":
+        return {"items": [{"path": p} for p in GH["trees"][GH["commits"][GH["branches"]["main"]]["tree"]]
+                          if q["q"].split()[0] in GH["trees"][GH["commits"][GH["branches"]["main"]]["tree"]][p]]}
+    parts = rest.split("/")
+    if parts[0] != "repos" or "/".join(parts[1:3]) != "nullable-eth/Whitehorse":
+        return JSONResponse({"message": "Not Found"}, status_code=404)
+    tail = "/".join(parts[3:])
+    def files_at(ref):
+        sha = GH["branches"].get(ref, ref)
+        return GH["trees"][GH["commits"][sha]["tree"]] if sha in GH["commits"] else None
+    if tail == "":
+        return {"default_branch": "main"}
+    if tail.startswith("git/ref/heads/"):
+        b = tail[len("git/ref/heads/"):]
+        if b not in GH["branches"]:
+            return JSONResponse({"message": "Not Found"}, status_code=404)
+        return {"object": {"sha": GH["branches"][b]}}
+    if tail.startswith("contents/"):
+        f = files_at(q.get("ref", "main")) or {}
+        path = tail[len("contents/"):]
+        if path not in f:
+            return JSONResponse({"message": "Not Found"}, status_code=404)
+        return {"encoding": "base64", "content": _b64.b64encode(f[path].encode()).decode()}
+    if tail.startswith("git/trees/") and request.method == "GET":
+        f = files_at(tail[len("git/trees/"):])
+        return {"tree": [{"path": p, "type": "blob"} for p in sorted(f)]}
+    if tail.startswith("git/commits/") and request.method == "GET":
+        return {"tree": {"sha": GH["commits"][tail[len("git/commits/"):]]["tree"]}}
+    if tail == "git/trees":
+        files = dict(GH["trees"][body["base_tree"]])
+        for e in body["tree"]:
+            if e.get("sha", "x") is None:
+                files.pop(e["path"], None)
+            else:
+                files[e["path"]] = e["content"]
+        t = _gh_sha(files); GH["trees"][t] = files
+        return {"sha": t}
+    if tail == "git/commits":
+        c = _gh_sha(body); GH["commits"][c] = {"tree": body["tree"], "parents": body["parents"],
+                                               "message": body["message"]}
+        return {"sha": c}
+    if tail == "git/refs":
+        GH["branches"][body["ref"][len("refs/heads/"):]] = body["sha"]
+        return {"ref": body["ref"]}
+    if tail.startswith("git/refs/heads/") and request.method == "PATCH":
+        GH["branches"][tail[len("git/refs/heads/"):]] = body["sha"]
+        return {}
+    if tail == "pulls" and request.method == "POST":
+        pr = {"number": len(GH["pulls"]) + 1, "title": body["title"], "body": body["body"],
+              "base": body["base"], "head": {"ref": body["head"]},
+              "html_url": f"https://github.test/pr/{len(GH['pulls']) + 1}"}
+        GH["pulls"].append(pr)
+        return pr
+    if tail == "pulls":
+        head = q.get("head", "")
+        return [p for p in GH["pulls"] if not head or head.endswith(":" + p["head"]["ref"])]
+    return JSONResponse({"message": f"fake has no {tail}"}, status_code=404)
+
+
 # ----------------------------------------------------------------- helpers
 def check(label: str, cond: bool, detail: str = "") -> None:
     if cond:
@@ -884,6 +971,114 @@ async def run_all():
 
 
 
+async def run_git():
+    print("\n[12] git tools: read, and propose changes only as PRs")
+    import gateway.config as gcfg
+    import gateway.gittools as git
+    import gateway.tools as gtools
+    gh_reset()
+    saved = (gcfg.GIT_TOKEN, gcfg.GIT_API)
+    gcfg.GIT_API = "http://127.0.0.1:18000/gh"
+    try:
+        gcfg.GIT_TOKEN = ""
+        check("no token: git tools are not offered at all",
+              not ({t["function"]["name"] for t in gtools.offered()} & git.NAMES))
+        check("no token: a git call explains what is missing",
+              "not configured" in await git.list_files("Whitehorse"))
+        gcfg.GIT_TOKEN = "ghtest"
+        check("with a token: git tools are offered",
+              git.NAMES <= {t["function"]["name"] for t in gtools.offered()})
+        import tempfile as _tf, os as _os
+        tok = _tf.NamedTemporaryFile("w", delete=False); tok.write("fromfile\n"); tok.close()
+        saved_env, saved_file = gcfg.GIT_TOKEN, gcfg.GIT_TOKEN_FILE
+        gcfg.GIT_TOKEN, gcfg.GIT_TOKEN_FILE = "", tok.name
+        check("a mounted token file is read without a restart", gcfg.git_token() == "fromfile")
+        with open(tok.name, "w") as fh: fh.write("rotated")
+        _os.utime(tok.name, (1, 1))
+        check("and a rotated one is picked up", gcfg.git_token() == "rotated")
+        gcfg.GIT_TOKEN_FILE = tok.name + ".missing"
+        check("a missing file means no token", gcfg.git_token() == "")
+        gcfg.GIT_TOKEN, gcfg.GIT_TOKEN_FILE = saved_env, saved_file
+
+        out = await git.list_files("whitehorse", "kubernetes/apps")
+        check("list is filtered by prefix, repo name case-insensitive",
+              "sonarr/helmrelease.yaml" in out and "README" not in out, out)
+        out = await git.read_file("Whitehorse", "kubernetes/apps/media/sonarr/helmrelease.yaml")
+        check("read returns the file with a line header", "lines 1-4 of 4" in out
+              and "memory: 512Mi" in out, out)
+        check("a repo outside the allowlist is refused",
+              (await git.read_file("upbound-official-build", "x")).startswith("REFUSED"))
+        check("search finds text", "sonarr" in await git.search("Whitehorse", "512Mi"))
+
+        path = "kubernetes/apps/media/sonarr/helmrelease.yaml"
+        out = await git.open_pr("Whitehorse", "fix(media): raise sonarr memory",
+                                "evidence here",
+                                [{"path": path, "old": "memory: 512Mi", "new": "memory: 768Mi"}])
+        check("an edit opens a PR", out.startswith("opened PR #1"), out)
+        pr = GH["pulls"][0]
+        branch = pr["head"]["ref"]
+        check("on an agent/ branch, against main",
+              branch.startswith("agent/fix-media-raise-sonarr-memory-") and pr["base"] == "main", branch)
+        check("main is untouched", "512Mi" in GH["trees"][GH["commits"][GH["branches"]["main"]]["tree"]][path])
+        check("the branch has the edit",
+              "768Mi" in GH["trees"][GH["commits"][GH["branches"][branch]]["tree"]][path])
+        check("the PR body says a human merges", "Nothing merges without a human" in pr["body"])
+
+        out = await git.open_pr("Whitehorse", "fix(media): raise sonarr memory more", "again",
+                                [{"path": path, "old": "768Mi", "new": "1Gi"}], branch=branch)
+        check("revising its own branch updates the same PR, no second PR",
+              "updating PR #1" in out and len(GH["pulls"]) == 1, out)
+        check("revision reads the branch, not main",
+              "1Gi" in GH["trees"][GH["commits"][GH["branches"][branch]]["tree"]][path])
+
+        async def refused(label, **kw):
+            args = dict(repo="Whitehorse", title="chore: something reasonable", body="b",
+                        changes=[{"path": "README.md", "old": "hello", "new": "bye"}])
+            args.update(kw)
+            o = await git.open_pr(**args)
+            check(label, o.startswith("REFUSED"), o)
+        before = dict(GH["branches"])
+        await refused("never commits to main", branch="main")
+        await refused("never commits to a non-agent branch", branch="feature/x")
+        await refused("an ambiguous or missing `old` is refused",
+                      changes=[{"path": "README.md", "old": "nope", "new": "x"}])
+        await refused("SOPS files are refused",
+                      changes=[{"path": "kubernetes/apps/ai/llm-api-key.sops.yaml", "content": "x"}])
+        await refused("CI workflows are refused",
+                      changes=[{"path": ".github/workflows/build.yml", "content": "x"}])
+        await refused("an edit that breaks YAML is refused",
+                      changes=[{"path": path, "old": "spec:", "new": "spec: ["}])
+        await refused("path traversal is refused",
+                      changes=[{"path": "../etc/passwd", "content": "x"}])
+        check("and none of the refusals wrote anything", GH["branches"] == before)
+
+        out = await git.open_pr("Whitehorse", "docs: add a note file", "new file",
+                                [{"path": "docs/note.md", "content": "note\n"},
+                                 {"path": "README.md", "delete": True}])
+        files = GH["trees"][GH["commits"][GH["branches"][GH["pulls"][-1]["head"]["ref"]]]["tree"]]
+        check("create and delete in one PR", files.get("docs/note.md") == "note\n"
+              and "README.md" not in files, str(sorted(files)))
+        check("list_prs shows only agent PRs",
+              "#1" in await git.list_prs("Whitehorse"))
+
+        said = []
+        async def _say(t): said.append(t)
+        real_say, gtools.announce = gtools.announce, _say
+        try:
+            await gtools.dispatch("git_read_file", {"repo": "Whitehorse", "path": "README.md"})
+            check("a read announces nothing", said == [], str(said))
+            await gtools.dispatch("git_open_pr", {"repo": "Whitehorse", "title": "chore: announce test",
+                                  "body": "b", "changes": [{"path": "x.md", "content": "x"}]})
+            check("opening a PR is announced like any other action",
+                  len(said) == 2 and "git_open_pr" in said[0] and "opened PR" in said[1], str(said))
+        finally:
+            gtools.announce = real_say
+        check("the token never appears in any output",
+              not any("ghtest" in str(v) for v in (out, said)))
+    finally:
+        gcfg.GIT_TOKEN, gcfg.GIT_API = saved
+
+
 async def main() -> int:
     up = uvicorn.Server(uvicorn.Config(fake, host="127.0.0.1", port=18000,
                                        log_level="error"))
@@ -897,6 +1092,7 @@ async def main() -> int:
         await asyncio.sleep(0.05)
     try:
         await run_all()
+        await run_git()
     finally:
         up.should_exit = px.should_exit = True
         await asyncio.gather(t1, t2, return_exceptions=True)

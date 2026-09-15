@@ -194,7 +194,7 @@ async def run(client, upstream: str, body: dict, auth: str, compactor,
         call_body["messages"] = messages
         call_body["stream"] = False
         if offer_tools:
-            call_body["tools"] = tools.TOOLS
+            call_body["tools"] = tools.offered()
         else:
             call_body.pop("tools", None)
             messages = messages + [{"role": "user", "content":

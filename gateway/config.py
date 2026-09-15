@@ -106,6 +106,37 @@ STRIP_SAMPLING_FIELDS = tuple(f.strip() for f in os.environ.get(
 SAMPLING_KEEP_CLIENTS = {c.strip() for c in os.environ.get(
     "GATEWAY_SAMPLING_KEEP_CLIENTS", "agentmemory-filing").split(",") if c.strip()}
 
+# ----------------------------------------------------------------------- git
+# Read the operator's repos and propose changes as pull requests. Off unless a
+# token is present; the tools are not even offered without one. The token is a
+# fine-grained PAT limited to these repos (Contents + Pull requests, read and
+# write). gittools.py enforces the rest: allowlisted repos only, commits only to
+# GIT_BRANCH_PREFIX branches, and the only write is a PR.
+GIT_TOKEN = os.environ.get("GIT_TOKEN", "").strip()
+# Preferred over the env var: a Secret mounted as an OPTIONAL volume. The
+# kubelet fills it in whenever the Secret appears or rotates, so adding or
+# replacing the token needs no restart. Read on use, cached by mtime.
+GIT_TOKEN_FILE = os.environ.get("GIT_TOKEN_FILE", "/var/run/secrets/git/GIT_TOKEN")
+_git_token_cache = {"mtime": None, "value": ""}
+
+
+def git_token() -> str:
+    if GIT_TOKEN:
+        return GIT_TOKEN
+    try:
+        mtime = os.stat(GIT_TOKEN_FILE).st_mtime
+    except OSError:
+        return ""
+    if mtime != _git_token_cache["mtime"]:
+        with open(GIT_TOKEN_FILE) as f:
+            _git_token_cache.update(mtime=mtime, value=f.read().strip())
+    return _git_token_cache["value"]
+GIT_API = os.environ.get("GIT_API", "https://api.github.com").rstrip("/")
+GIT_OWNER = os.environ.get("GIT_OWNER", "nullable-eth")
+GIT_REPOS = [r.strip() for r in os.environ.get(
+    "GIT_REPOS", "Whitehorse,cluster-agent,agentmemory,llm-gateway").split(",") if r.strip()]
+GIT_BRANCH_PREFIX = os.environ.get("GIT_BRANCH_PREFIX", "agent/")
+
 # --------------------------------------------------------------------- tools
 # Always on where enabled, because the chat clients in play expose a fixed
 # api-key field and no way to send an extra header — per-request opt-in was

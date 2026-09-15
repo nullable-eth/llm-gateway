@@ -1,7 +1,7 @@
 """Tool-use guidance injected alongside the tools.
 
 The client does not know these tools exist. Jan sends a chat request; the
-gateway quietly attaches five tools it never asked for. Handing a model tools
+gateway quietly attaches tools it never asked for. Handing a model tools
 with no instruction on how to spend them is how you get what we measured
 against the live archive: thirteen `search_memory` calls in one run, each a
 slight rewording of the last, because a 500-char snippet was not enough and
@@ -33,8 +33,13 @@ annotate, force a reconcile. Every action you take is posted to the operator's \
 Discord channel as it happens, including the ones that get refused, so act \
 where it helps and expect to be seen doing it.
 - Flux owns desired state and reverts direct writes within 30 minutes. So a \
-write is a way to restore service NOW; anything meant to STICK is a git change \
-you describe in the report, not a kubectl command.
+write is a way to restore service NOW; anything meant to STICK is a git change.
+- When git tools are present, make that change yourself as a pull request: \
+find the file (git_list_files / git_search in Whitehorse, the cluster's GitOps \
+repo), git_read_file it, then git_open_pr with small exact edits and a body \
+giving the evidence and how to verify. The operator reviews and merges it; \
+never claim a PR is applied until it is merged. Keep PRs focused, one change \
+each, and give the PR link in your answer.
 - silence_alert only when the operator has already said this state is known. \
 Their words, cited, or not at all — never your own judgement that something \
 looks unimportant.

@@ -102,6 +102,9 @@ Until then, treat the inference key as cluster-read-capable.
 | `COMPACT_N_CTX` | `0` | Override the probed window — **set this when the server runs more than one slot**, since what matters is `n_ctx / n_parallel` |
 | `GATEWAY_STRIP_SAMPLING` | `0` | Drop client sampling fields (`temperature`, `top_p`, `top_k`, `min_p`, penalties, …) so the model server's `--temp`/`--top-p`/… flags always apply. The archive still records what the client sent |
 | `GATEWAY_SAMPLING_KEEP_CLIENTS` | `agentmemory-filing` | `X-Capture-Client` names whose sampling is deliberate and kept |
+| `GIT_TOKEN_FILE` / `GIT_TOKEN` | `/var/run/secrets/git/GIT_TOKEN` / *(empty)* | Fine-grained GitHub PAT (Contents + Pull requests RW on the allowed repos). Without one the git tools are not offered. The file is re-read on change, so mounting it from an optional Secret needs no restart |
+| `GIT_OWNER` / `GIT_REPOS` | `nullable-eth` / `Whitehorse,cluster-agent,agentmemory,llm-gateway` | The only repos the git tools touch |
+| `GIT_BRANCH_PREFIX` | `agent/` | The only branches the agent commits to; its only write is a PR (`git_open_pr`). SOPS files and CI workflows are refused, YAML must still parse |
 | `MODE` | `propose` | `propose` or `auto`; auto alone still needs phase-2 RBAC |
 | `PROTECTED` | *(empty)* | Components the agent may not act on |
 | `TOOL_MAX_STEPS` | `8` | Model+tool round trips before it must answer |

@@ -32,7 +32,7 @@ import subprocess
 
 import httpx
 
-from . import config
+from . import config, gittools
 
 log = logging.getLogger("gateway")
 
@@ -312,6 +312,12 @@ TOOLS = [
 ]
 
 
+def offered() -> list:
+    """The tools handed to the model on this call. Git tools only when a
+    token exists, so an unconfigured gateway does not advertise dead tools."""
+    return TOOLS + (gittools.TOOLS if config.git_token() else [])
+
+
 def is_mutation(name: str, args: dict) -> bool:
     """Does this call change something outside this process?
 
@@ -319,7 +325,7 @@ def is_mutation(name: str, args: dict) -> bool:
     tools", so a tool added later is announced by default instead of being
     silently exempt until someone remembers to add it here.
     """
-    if name in ("ha_call_service", "silence_alert"):
+    if name in ("ha_call_service", "silence_alert", "git_open_pr"):
         return True
     if name == "run_kubectl":
         argv = [str(a).lower() for a in (args.get("args") or [])]
@@ -376,6 +382,8 @@ async def dispatch(name: str, args: dict) -> str:
 async def _dispatch(name: str, args: dict) -> str:
     if name == "run_kubectl":
         return await asyncio.to_thread(run_kubectl, args.get("args", []))
+    if name in gittools.NAMES:
+        return await gittools.dispatch(name, args)
     if name == "ha_get_states":
         return await ha_get_states(args.get("entity_id", ""))
     if name == "ha_call_service":

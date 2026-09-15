@@ -26,7 +26,8 @@ RUN set -eu; \
 # Deliberately narrower than agentmemory's: no asyncpg, no mcp. This container
 # sits on the serving path, so its dependency surface is a liability.
 RUN pip install --no-cache-dir \
-    fastapi==0.115.* uvicorn==0.30.* httpx==0.27.* prometheus-client==0.20.*
+    fastapi==0.115.* uvicorn==0.30.* httpx==0.27.* prometheus-client==0.20.* \
+    pyyaml==6.*
 
 COPY gateway/ /srv/app/gateway/
 EXPOSE 8010
