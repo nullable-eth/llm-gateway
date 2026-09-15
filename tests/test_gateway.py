@@ -788,6 +788,15 @@ async def run_all():
     real_httpx, gtools.httpx.AsyncClient = gtools.httpx.AsyncClient, _FakeC
     real_tok, gcfg.DISCORD_BOT_TOKEN = gcfg.DISCORD_BOT_TOKEN, "tok"
     real_hook, gcfg.DISCORD_WEBHOOK = gcfg.DISCORD_WEBHOOK, "https://hook.test/x"
+    real_chan, gcfg.DISCORD_CHANNEL_ID = gcfg.DISCORD_CHANNEL_ID, ""
+    status = {"code": 200}
+    class _Resp:
+        def __init__(self): self.status_code, self.text = status["code"], "Unknown Webhook"
+    class _FakeC2(_FakeC):
+        async def post(self, url, **kw):
+            posted.append((url, kw.get("json", {}).get("content", "")))
+            return _Resp() if not url.endswith("/ok") else type("R", (), {"status_code": 200, "text": ""})()
+    gtools.httpx.AsyncClient = _FakeC2
     try:
         gtools.ANNOUNCE_TO.set("998877")
         await gtools.announce("did a thing")
@@ -795,11 +804,24 @@ async def run_all():
               posted and "/channels/998877/messages" in posted[-1][0], str(posted[-1:]))
         gtools.ANNOUNCE_TO.set("")
         await gtools.announce("did a thing")
-        check("without one, it falls back to the webhook",
+        check("without a thread or channel, it falls back to the webhook",
               posted[-1][0] == "https://hook.test/x", str(posted[-1:]))
+        gcfg.DISCORD_CHANNEL_ID = "4242"
+        n = len(posted)
+        await gtools.announce("chat action")
+        check("without a thread, the bot posts to the actions channel first",
+              "/channels/4242/messages" in posted[n][0] and len(posted) == n + 1,
+              str(posted[n:]))
+        status["code"] = 404
+        n = len(posted)
+        await gtools.announce("channel is broken")
+        check("a failed post (HTTP 404) is not treated as delivered: the next target is tried",
+              [u for u, _ in posted[n:]] == ["https://discord.com/api/v10/channels/4242/messages",
+                                              "https://hook.test/x"], str(posted[n:]))
     finally:
         gtools.httpx.AsyncClient = real_httpx
         gcfg.DISCORD_BOT_TOKEN, gcfg.DISCORD_WEBHOOK = real_tok, real_hook
+        gcfg.DISCORD_CHANNEL_ID = real_chan
     said: list[str] = []
     async def _say(t): said.append(t)
     real_say, gtools.announce = gtools.announce, _say

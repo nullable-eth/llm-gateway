@@ -26,6 +26,9 @@ from .capture.writer import Writer
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("capture")
+# httpx logs every request URL at INFO. A Discord webhook URL is a credential,
+# and it was landing in the pod log on every announcement.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 CHAT_PATH = "/v1/chat/completions"
 # llama.cpp serves the un-versioned alias too, and plenty of clients use it —

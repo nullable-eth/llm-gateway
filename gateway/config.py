@@ -210,3 +210,9 @@ DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 # thread id in X-Discord-Thread), so the change and the alert that caused it sit
 # in one place instead of two channels nobody reads together.
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+# Where actions without an incident thread go (a chat client asking the agent
+# to do something). Posted with the bot token, same as thread posts. Preferred
+# over DISCORD_WEBHOOK, which is kept only as a last resort: a deleted webhook
+# is what made every chat-initiated action unannounced (404 Unknown Webhook,
+# never checked) on 2026-09-15.
+DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
