@@ -21,9 +21,115 @@ import logging
 import random
 import time
 
+import httpx
+
 from . import config, tools
+from .capture.sse import ChatAccumulator
 
 log = logging.getLogger("gateway")
+
+
+class UpstreamError(Exception):
+    """A step failed at the model server after its retries."""
+
+
+def _describe(name: str, args: dict) -> str:
+    """One line for the live thinking stream, so a watching client sees what
+    the loop is doing instead of a silent pause."""
+    if name == "run_kubectl" and isinstance(args.get("args"), list):
+        detail = "kubectl " + " ".join(str(a) for a in args["args"])
+    else:
+        detail = json.dumps(args, ensure_ascii=False)
+    if len(detail) > 300:
+        detail = detail[:300] + "…"
+    return f"\n\n[tool] {name}: {detail}\n\n"
+
+
+async def _post(client, url: str, body: dict, headers: dict, budget: float, emit):
+    """One model call. Returns (status, response dict or None, error text).
+
+    Without `emit` it is the plain non-streamed call. With it, the call is
+    streamed and every reasoning/content delta is handed to `emit` as it
+    arrives, then the step is reassembled into the same dict shape a
+    non-streamed call returns, so the loop cannot tell the difference. Tool
+    call fragments are NOT forwarded: the client never asked for tools.
+    """
+    if emit is None:
+        r = await client.post(url, json=body, headers=headers, timeout=budget)
+        if r.status_code >= 400:
+            return r.status_code, None, r.text
+        return r.status_code, r.json(), ""
+
+    body = dict(body, stream=True)
+    acc = ChatAccumulator()
+    tail: dict = {}
+
+    async def consume():
+        async with client.stream("POST", url, json=body, headers=headers,
+                                 timeout=budget) as r:
+            if r.status_code >= 400:
+                return r.status_code, (await r.aread()).decode("utf-8", "replace")
+            async for line in r.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(payload)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("error"):
+                    # llama.cpp reports a mid-stream failure (a malformed tool
+                    # call, usually) as an error event; same class as a 500.
+                    return 500, json.dumps(obj["error"])[:500]
+                for k in ("id", "model", "timings"):
+                    if obj.get(k) is not None:
+                        tail[k] = obj[k]
+                acc.event(obj)
+                ch = (obj.get("choices") or [{}])[0]
+                d = ch.get("delta") if isinstance(ch, dict) else None
+                if not isinstance(d, dict):
+                    continue
+                out = {}
+                r_ = d.get("reasoning_content", d.get("reasoning"))
+                if isinstance(r_, str) and r_:
+                    out["reasoning_content"] = r_
+                if isinstance(d.get("content"), str) and d["content"]:
+                    out["content"] = d["content"]
+                if out:
+                    await emit(out)
+            return r.status_code, ""
+
+    # A streamed read timeout is per chunk, not per call; bound the whole call
+    # so the loop's deadlines mean what they meant when steps were not streamed.
+    try:
+        status, err = await asyncio.wait_for(consume(), timeout=budget)
+    except asyncio.TimeoutError as e:
+        raise httpx.ReadTimeout(f"model step exceeded {budget:.0f}s") from e
+    if status >= 400:
+        return status, None, err
+
+    m = acc.message()
+    message = {"role": "assistant", "content": m.content}
+    if m.reasoning:
+        message["reasoning_content"] = m.reasoning
+    if m.tool_calls:
+        message["tool_calls"] = [
+            {"id": c["id"] or f"call_{i}", "type": "function",
+             "function": {"name": c["name"], "arguments": c["arguments"]}}
+            for i, c in enumerate(m.tool_calls)]
+    resp = {"id": tail.get("id") or "gw", "object": "chat.completion",
+            "model": tail.get("model") or acc.model or "",
+            "choices": [{"index": 0, "message": message,
+                         "finish_reason": acc.finish_reason or "stop"}]}
+    if acc.usage:
+        resp["usage"] = acc.usage
+    if tail.get("timings"):
+        resp["timings"] = tail["timings"]
+    return status, resp, ""
 
 
 def _args_of(call: dict) -> dict:
@@ -51,8 +157,16 @@ def _render_finish(args: dict) -> str:
     return "\n\n".join(x for x in out if x) or NOTHING_SAID
 
 
-async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[dict, list]:
-    """Returns (final upstream response, full message list including tool traffic)."""
+async def run(client, upstream: str, body: dict, auth: str, compactor,
+              emit=None) -> tuple[dict, list]:
+    """Returns (final upstream response, full message list including tool traffic).
+
+    `emit`, when given, is an async callable receiving chat-completion deltas
+    ({"reasoning_content": ...} / {"content": ...}) as they happen: every
+    step's thinking, a line per tool call, and the answer, token by token.
+    That is what lets a streaming client show live thinking and a real
+    "thought for" time instead of one burst when the whole loop is done.
+    """
     messages = list(body.get("messages") or [])
     headers = {"Authorization": auth} if auth else {}
     last = None
@@ -106,12 +220,12 @@ async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[
         # agent's. Retried here, where the bad sample actually happens.
         attempt_body = call_body
         for attempt in range(3):
-            r = await client.post(f"{upstream}/v1/chat/completions", json=attempt_body,
-                                  headers=headers, timeout=budget)
-            if r.status_code < 500 or attempt == 2:
+            status, last, err = await _post(client, f"{upstream}/v1/chat/completions",
+                                            attempt_body, headers, budget, emit)
+            if status < 500 or attempt == 2:
                 break
             log.warning("upstream %s on step %d (attempt %d/3): %s",
-                        r.status_code, step, attempt + 1, r.text[:160].replace("\n", " "))
+                        status, step, attempt + 1, err[:160].replace("\n", " "))
             attempt_body = dict(call_body)
             if attempt == 0:
                 # A retry of an identical request is not a resample: sampling is
@@ -127,8 +241,8 @@ async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[
                 attempt_body["messages"] = messages + [{"role": "user", "content":
                     "Answer directly, in prose, without calling any tool."}]
             await asyncio.sleep(0.5 * (attempt + 1))
-        r.raise_for_status()
-        last = r.json()
+        if status >= 400 or last is None:
+            raise UpstreamError(f"model server returned {status}: {err[:300]}")
         msg = ((last.get("choices") or [{}])[0].get("message") or {})
         calls = msg.get("tool_calls") or []
 
@@ -157,6 +271,8 @@ async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[
                     continue
                 text = (msg.get("reasoning_content") or "").strip() \
                     or "(the model returned an empty answer)"
+                if emit is not None:
+                    await emit({"content": text})
                 last.setdefault("choices", [{}])[0]["message"] = {
                     "role": "assistant", "content": text}
                 log.warning("agentloop: still empty; returned reasoning/placeholder")
@@ -183,6 +299,8 @@ async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[
                     break
                 assistant["content"] = report
                 assistant.pop("tool_calls", None)
+                if emit is not None:
+                    await emit({"content": report})
                 last.setdefault("choices", [{}])[0]["message"] = dict(assistant)
                 last["choices"][0]["finish_reason"] = "stop"
                 return last, messages
@@ -192,6 +310,8 @@ async def run(client, upstream: str, body: dict, auth: str, compactor) -> tuple[
 
         for call in calls:
             name = (call.get("function") or {}).get("name") or ""
+            if emit is not None:
+                await emit({"reasoning_content": _describe(name, _args_of(call))})
             out = await tools.dispatch(name, _args_of(call))
             log.info("tool %s -> %d chars", name, len(out))
             messages.append({"role": "tool", "tool_call_id": call.get("id") or "",

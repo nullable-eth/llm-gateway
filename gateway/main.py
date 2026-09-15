@@ -187,6 +187,81 @@ def _as_client_response(final: dict, wants_stream: bool):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+KEEPALIVE_S = 15
+# asyncio holds tasks weakly. A run whose client hung up is referenced by
+# nothing else and could be collected mid-loop; this keeps it alive to finish.
+_RUNS: set = set()
+
+
+def _live_stream(model: str, run, on_done):
+    """Stream a tool run as it happens.
+
+    `run(emit)` is the loop; `emit` receives deltas which are relayed as SSE
+    the moment they exist, so a client shows the model's thinking live and
+    times it honestly. Tool execution produces no tokens, so SSE comments go
+    out while it runs to keep proxies from calling the connection idle.
+
+    The loop runs in its own task: a client that hangs up does not cancel it,
+    so the archive still gets the whole run, exactly as before. Once the
+    response has started, an HTTP status can no longer change, so a failure is
+    reported in-band as a final content chunk.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    cid = "gw-" + store.now_iso()
+
+    async def emit(delta: dict) -> None:
+        await queue.put(("delta", delta))
+
+    async def worker():
+        try:
+            final, produced = await run(emit)
+            on_done(final, produced)
+            await queue.put(("done", final))
+        except Exception as e:                      # reported in-band below
+            await queue.put(("error", e))
+
+    task = asyncio.create_task(worker())
+    _RUNS.add(task)
+    task.add_done_callback(_RUNS.discard)
+
+    def frame(delta: dict, finish=None, extra=None) -> bytes:
+        obj = {"id": cid, "object": "chat.completion.chunk", "model": model,
+               "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        if extra:
+            obj.update(extra)
+        return b"data: " + json.dumps(obj).encode() + b"\n\n"
+
+    async def gen():
+        yield frame({"role": "assistant"})
+        while True:
+            try:
+                kind, val = await asyncio.wait_for(queue.get(), KEEPALIVE_S)
+            except asyncio.TimeoutError:
+                yield b": working\n\n"
+                continue
+            if kind == "delta":
+                yield frame(val)
+                continue
+            if kind == "done":
+                ch = (val.get("choices") or [{}])[0]
+                extra = {k: val[k] for k in ("usage", "timings") if val.get(k)}
+                yield frame({}, finish=ch.get("finish_reason") or "stop", extra=extra)
+            else:
+                timed_out = isinstance(val, httpx.TimeoutException)
+                metrics.UPSTREAM_ERRORS.labels(endpoint=CHAT_PATH).inc()
+                if timed_out:
+                    log.warning("agentloop timed out (streaming): %s", val)
+                else:
+                    log.error("agentloop failed (streaming): %r", val)
+                what = "timed out" if timed_out else "failed"
+                yield frame({"content": f"\n\n[gateway: agent loop {what}: {val}]"},
+                            finish="stop")
+            yield b"data: [DONE]\n\n"
+            return
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
 def _strip_sampling(body: bytes):
     """(new_body, obj) with the client's sampling fields removed, or None when
     there is nothing to remove or the body is not a JSON object."""
@@ -276,6 +351,19 @@ async def proxy(path: str, request: Request):
         # incident thread it is working in; a chat client sends nothing and the
         # announcements fall back to the webhook (or to logs alone).
         tools.ANNOUNCE_TO.set(request.headers.get("x-discord-thread", "") or "")
+        wants_stream = bool(parsed.get("stream"))
+        if wants_stream:
+            def on_done(final, produced):
+                metrics.REQUESTS.labels(endpoint=endpoint, streamed="true").inc()
+                metrics.TOOL_STEPS.inc(max(0, len(produced) - len(sent)))
+                _record_loop(parsed, produced[len(sent):], started,
+                             request.headers, compaction)
+            compactor = request.app.state.compactor
+            return _live_stream(
+                str(parsed.get("model") or "gateway"),
+                lambda emit: agentloop.run(client, config.UPSTREAM, loop_body,
+                                           auth, compactor, emit=emit),
+                on_done)
         try:
             final, produced = await agentloop.run(
                 client, config.UPSTREAM, loop_body, auth,

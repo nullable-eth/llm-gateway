@@ -114,10 +114,14 @@ Full list in `gateway/config.py`, which is the only place env is read.
 
 ## Known edges
 
-- **Streaming with tools is re-emitted, not relayed.** A tool run is many
-  upstream calls, so there is no single stream to pass through; the finished
-  answer is chunked into SSE frames. Clients render it fine, but it arrives in
-  blocks rather than token by token.
+- **Streaming with tools is stitched live.** A tool run is many upstream
+  calls, so a streaming client gets each step's `reasoning_content` and
+  `content` relayed as it is generated, plus a `[tool] name: args` line in the
+  thinking for every tool call. Tool-call deltas are never forwarded (the
+  client did not ask for tools), SSE comments keep the connection alive while
+  a tool runs, and because the status line is already sent, a failure arrives
+  in-band as a final `[gateway: agent loop failed/timed out]` chunk rather
+  than a 502/504. Non-streaming callers (cluster-agent) are unchanged.
 - **A loop must finish inside its caller's patience.** Steps do not bound
   wall clock — they get slower as the conversation grows — so there is a
   separate `TOOL_MAX_SECONDS` budget, past which the tools are withdrawn and

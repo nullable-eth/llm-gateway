@@ -105,6 +105,9 @@ async def completions(request: Request):
                 "role": "assistant",
                 "content": "STATE: user is migrating the cluster; PVCs renamed."}}]}
     spec = NEXT_QUEUE.pop(0) if NEXT_QUEUE else dict(NEXT)
+    if spec.get("status"):
+        return JSONResponse({"error": {"message": "fake failure"}},
+                            status_code=spec["status"])
     if not body.get("stream"):
         msg = {"role": "assistant", "content": spec.get("content", "")}
         if spec.get("reasoning"):
@@ -181,6 +184,25 @@ async def chat(messages, stream=True, headers=None, abort_after=None, extra=None
         # which is a beat after the client side has let go.
         await asyncio.sleep(2.0)
     return None
+
+
+async def stream_frames(messages, headers=None):
+    """POST a streamed chat and return [(seconds_since_start, obj)]."""
+    import time as _t
+    payload = {"model": "qwen3.6-35b-a3b", "messages": messages, "stream": True}
+    out, t0 = [], _t.monotonic()
+    async with httpx.AsyncClient(timeout=60) as c:
+        async with c.stream("POST", f"{PROXY}/v1/chat/completions",
+                            json=payload, headers=headers or {}) as r:
+            async for line in r.aiter_lines():
+                if line.startswith("data:") and line[5:].strip() != "[DONE]":
+                    out.append((_t.monotonic() - t0, json.loads(line[5:])))
+    return out
+
+
+def deltas(frames, key):
+    return "".join((o["choices"][0]["delta"].get(key) or "")
+                   for _, o in frames if o.get("choices"))
 
 
 def sweep():
@@ -777,6 +799,69 @@ async def run_all():
                   "tool budget is spent" in json.dumps(LAST_UPSTREAM))
         finally:
             gcfg.TOOL_MAX_SECONDS = was_secs
+
+        # ------------------------------------------------------------ [11b]
+        print("\n[11b] a streaming client watches the loop live")
+        NEXT_QUEUE[:] = [
+            {"reasoning": "I need to look at the pods first.", "delay": 0.03,
+             "tool_calls": [{"id": "s1", "type": "function", "function": {
+                 "name": "run_kubectl",
+                 "arguments": '{"args": ["get", "pods", "-n", "media"]}'}}]},
+            {"reasoning": "jellyfin-0 is the only pod.", "delay": 0.03,
+             "content": "One pod runs in media: jellyfin-0."},
+        ]
+        frames = await stream_frames(
+            [{"role": "user", "content": "Stream me the media pods."}], AUTH)
+        thinking = deltas(frames, "reasoning_content")
+        answer = deltas(frames, "content")
+        check("thinking from every step reaches the client",
+              "look at the pods first" in thinking and "only pod" in thinking, thinking)
+        check("each tool call is announced inside the thinking",
+              "[tool] run_kubectl: kubectl get pods -n media" in thinking, thinking)
+        check("the answer is streamed and complete",
+              answer == "One pod runs in media: jellyfin-0.", repr(answer))
+        r_times = [t for t, o in frames if o.get("choices")
+                   and o["choices"][0]["delta"].get("reasoning_content")]
+        check("thinking arrives token by token over time, not in one burst",
+              len(r_times) > 5 and r_times[-1] - r_times[0] > 0.15,
+              f"{len(r_times)} chunks over {r_times[-1] - r_times[0] if r_times else 0:.2f}s")
+        check("the client never sees a tool_call delta",
+              not any(o["choices"][0]["delta"].get("tool_calls")
+                      for _, o in frames if o.get("choices")))
+        check("the stream ends with a finish_reason",
+              frames and frames[-1][1]["choices"][0]["finish_reason"] == "stop",
+              str(frames[-1][1]) if frames else "no frames")
+        check("upstream steps were requested as streams",
+              LAST_UPSTREAM.get("stream") is True, str(LAST_UPSTREAM.get("stream")))
+        await settle()
+        sweep()
+        sf = [f for f in capture_files() if "Stream me the media pods" in f.name]
+        check("a streamed loop is archived like any other", len(sf) == 1,
+              str([f.name for f in capture_files()]))
+        if sf:
+            st = sf[0].read_text(encoding="utf-8")
+            check("with its tool call and result",
+                  "Tool call · `run_kubectl`" in st
+                  and "FAKE kubectl get pods -n media" in st)
+
+        NEXT_QUEUE[:] = [
+            {"tool_calls": [{"id": "f2", "type": "function", "function": {
+                "name": "finish",
+                "arguments": json.dumps({"summary": "Streamed report."})}}]},
+        ]
+        frames = await stream_frames(
+            [{"role": "user", "content": "Finish over a stream."}], AUTH)
+        check("a finish() report is delivered as streamed content",
+              deltas(frames, "content") == "Streamed report.",
+              repr(deltas(frames, "content")))
+
+        NEXT_QUEUE[:] = [{"status": 500}, {"status": 500}, {"status": 500}]
+        frames = await stream_frames(
+            [{"role": "user", "content": "Break over a stream."}], AUTH)
+        check("a failure after the stream started is reported in-band",
+              "[gateway: agent loop failed" in deltas(frames, "content"),
+              repr(deltas(frames, "content")))
+        NEXT_QUEUE.clear()
 
         NEXT_QUEUE[:] = [
             {"tool_calls": [{"id": "f1", "type": "function", "function": {
