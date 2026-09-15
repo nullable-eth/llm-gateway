@@ -1,4 +1,4 @@
-# llm-gateway
+# llm-gateway (live test)
 
 An OpenAI-API-transparent gateway that sits in front of a llama.cpp (or any
 OpenAI-compatible) server and adds capabilities every caller gets, whatever
