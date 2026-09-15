@@ -93,14 +93,19 @@ COMPACT_N_CTX = int(os.environ.get("COMPACT_N_CTX", "0"))
 # "turn off the kitchen light" should not be paying for tool definitions, and
 # should not be holding kubectl.
 TOOLS_ENABLED = os.environ.get("GATEWAY_TOOLS", "0") not in ("0", "false", "no", "")
-TOOL_MAX_STEPS = int(os.environ.get("TOOL_MAX_STEPS", "8"))
+# Raised from 8 after a real incident: eight steps was not enough to even
+# IDENTIFY a failing target, let alone fix it. The agent spent all eight on
+# discovery, reported "budget ran out before I could check", and changed
+# nothing, while the fault sat two kubectl calls away. Prefer dozens of cheap
+# calls over a confident shrug.
+TOOL_MAX_STEPS = int(os.environ.get("TOOL_MAX_STEPS", "40"))
 # Wall-clock budget for starting NEW tool work, in seconds. A step budget does
 # not bound time: steps get slower as the conversation grows, so 12 steps can
 # be two minutes or twelve. Callers have their own timeouts — cluster-agent
-# waits 300s — and a loop that outruns them does the work, gets abandoned, and
+# waits 1500s — and a loop that outruns them does the work, gets abandoned, and
 # reports nothing. Past this the tools are withdrawn and the model must answer,
 # leaving the remainder of the caller's patience for that final reply.
-TOOL_MAX_SECONDS = int(os.environ.get("TOOL_MAX_SECONDS", "180"))
+TOOL_MAX_SECONDS = int(os.environ.get("TOOL_MAX_SECONDS", "960"))
 # ...and a hard ceiling on the whole request, because withdrawing the tools does
 # not bound anything on its own: the final generation was issued with no timeout
 # at all, so a loop could and did run past the caller's patience and get
@@ -108,12 +113,13 @@ TOOL_MAX_SECONDS = int(os.environ.get("TOOL_MAX_SECONDS", "180"))
 # this deadline (never less than the floor), so the request either answers
 # inside REQUEST_MAX_SECONDS or fails as a timeout the caller can report,
 # instead of racing it.
-REQUEST_MAX_SECONDS = int(os.environ.get("REQUEST_MAX_SECONDS", "240"))
+REQUEST_MAX_SECONDS = int(os.environ.get("REQUEST_MAX_SECONDS", "1140"))
 UPSTREAM_MIN_TIMEOUT_S = int(os.environ.get("UPSTREAM_MIN_TIMEOUT_S", "30"))
 # The final answer's own budget, on top of the deadline above rather than
 # inside it. Worst case per request is therefore ~REQUEST_MAX + ANSWER_TIMEOUT,
-# which must stay under the caller's timeout (cluster-agent: 420s).
-ANSWER_TIMEOUT_S = int(os.environ.get("ANSWER_TIMEOUT_S", "150"))
+# which must stay under the caller's timeout (cluster-agent: 1500s). 1140+240
+# leaves ~2 minutes of headroom.
+ANSWER_TIMEOUT_S = int(os.environ.get("ANSWER_TIMEOUT_S", "240"))
 TOOL_OUTPUT_MAX = int(os.environ.get("TOOL_OUTPUT_MAX", "8000"))
 KUBECTL_TIMEOUT_S = int(os.environ.get("KUBECTL_TIMEOUT_S", "60"))
 # Guidance injected with the tools. The client never asked for the tools and
