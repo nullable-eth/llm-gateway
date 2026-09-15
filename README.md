@@ -100,6 +100,8 @@ Until then, treat the inference key as cluster-read-capable.
 | `COMPACT_AT` | `0.75` | Fraction of context a prompt may occupy |
 | `COMPACT_KEEP_TAIL` | `8` | Recent messages kept verbatim |
 | `COMPACT_N_CTX` | `0` | Override the probed window — **set this when the server runs more than one slot**, since what matters is `n_ctx / n_parallel` |
+| `GATEWAY_STRIP_SAMPLING` | `0` | Drop client sampling fields (`temperature`, `top_p`, `top_k`, `min_p`, penalties, …) so the model server's `--temp`/`--top-p`/… flags always apply. The archive still records what the client sent |
+| `GATEWAY_SAMPLING_KEEP_CLIENTS` | `agentmemory-filing` | `X-Capture-Client` names whose sampling is deliberate and kept |
 | `MODE` | `propose` | `propose` or `auto`; auto alone still needs phase-2 RBAC |
 | `PROTECTED` | *(empty)* | Components the agent may not act on |
 | `TOOL_MAX_STEPS` | `8` | Model+tool round trips before it must answer |

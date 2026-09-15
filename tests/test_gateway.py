@@ -161,8 +161,9 @@ def rows(text: str) -> list:
     return list(vaultio.chunk_transcript(body_of(text), 6000))
 
 
-async def chat(messages, stream=True, headers=None, abort_after=None):
-    payload = {"model": "qwen3.8-27b", "messages": messages, "stream": stream}
+async def chat(messages, stream=True, headers=None, abort_after=None, extra=None):
+    payload = {"model": "qwen3.8-27b", "messages": messages, "stream": stream,
+               **(extra or {})}
     async with httpx.AsyncClient(timeout=30) as c:
         if not stream:
             r = await c.post(f"{PROXY}/v1/chat/completions", json=payload,
@@ -517,9 +518,60 @@ async def run_all():
                   for m in tail if m["role"] == "tool"),
           f"cut={cut} roles={[m['role'] for m in tail]}")
 
+    # --------------------------------------------------------------- [10]
+    print("\n[10] sampling belongs to the server when stripping is on")
+    import gateway.config as gcfg
+    SAMPLING = {"temperature": 0.9, "top_p": 0.5, "top_k": 3,
+                "presence_penalty": 1.0, "max_tokens": 64}
+    NEXT = {"content": "sampled"}
+    await chat([{"role": "user", "content": "Default passthrough sampling."}],
+               stream=False, extra=SAMPLING)
+    check("off by default: client sampling is forwarded untouched",
+          LAST_UPSTREAM.get("temperature") == 0.9
+          and LAST_UPSTREAM.get("top_k") == 3, str(LAST_UPSTREAM)[:200])
+    was_strip, gcfg.STRIP_SAMPLING = gcfg.STRIP_SAMPLING, True
+    try:
+        await chat([{"role": "user", "content": "Stripped sampling please."}],
+                   stream=False, extra=SAMPLING)
+        check("on: every sampling field is dropped",
+              not any(k in LAST_UPSTREAM for k in
+                      ("temperature", "top_p", "top_k", "presence_penalty")),
+              str(LAST_UPSTREAM)[:200])
+        check("but non-sampling fields survive",
+              LAST_UPSTREAM.get("max_tokens") == 64
+              and LAST_UPSTREAM.get("messages"), str(LAST_UPSTREAM)[:200])
+        await chat([{"role": "user", "content": "Streamed stripped sampling."}],
+                   extra=SAMPLING)
+        check("streamed requests are stripped too",
+              "temperature" not in LAST_UPSTREAM
+              and LAST_UPSTREAM.get("stream") is True, str(LAST_UPSTREAM)[:200])
+        await chat([{"role": "user", "content": "Classify this file."}],
+                   stream=False, extra={"temperature": 0.1},
+                   headers={"X-Capture-Client": "agentmemory-filing"})
+        check("an allowlisted machine client keeps its deliberate sampling",
+              LAST_UPSTREAM.get("temperature") == 0.1, str(LAST_UPSTREAM)[:200])
+        await chat([{"role": "user", "content": "Pretend client."}],
+                   stream=False, extra={"temperature": 0.1},
+                   headers={"X-Capture-Client": "not-on-the-list"})
+        check("an unrecognised client name keeps nothing",
+              "temperature" not in LAST_UPSTREAM, str(LAST_UPSTREAM)[:200])
+        big_s = [dict(m) for m in big]
+        big_s[-1] = {"role": "user", "content": "final sampled question"}
+        await chat(big_s, stream=False, headers=AUTH, extra=SAMPLING)
+        check("a compacted request is rebuilt without the client's sampling",
+              any("[COMPACTED CONVERSATION STATE]" in str(m.get("content", ""))
+                  for m in LAST_UPSTREAM.get("messages", []))
+              and "temperature" not in LAST_UPSTREAM, str(LAST_UPSTREAM)[:200])
+        async with httpx.AsyncClient(timeout=10) as c:
+            mt = (await c.get(f"{PROXY}/__capture/metrics")).text
+        check("stripping is counted",
+              "gateway_sampling_stripped_total 4.0" in mt,
+              [l for l in mt.splitlines() if "sampling_stripped" in l])
+    finally:
+        gcfg.STRIP_SAMPLING = was_strip
+
     # --------------------------------------------------------------- [11]
     print("\n[11] tool loop")
-    import gateway.config as gcfg
     import gateway.tools as gtools
     check("guard allows a plain read",
           gtools.kubectl_guard(["get", "pods", "-n", "ai"]) is None)

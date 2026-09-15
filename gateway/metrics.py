@@ -27,6 +27,10 @@ COMPACTED = Counter("capture_compacted_total",
 SUPPRESSED = Counter("capture_suppressed_total",
                      "Exchanges proxied without writing a transcript",
                      ["client"])
+# Requests whose client-supplied sampling fields were dropped so the model
+# server's own settings apply (GATEWAY_STRIP_SAMPLING).
+SAMPLING_STRIPPED = Counter("gateway_sampling_stripped_total",
+                            "Requests forwarded without the client's sampling fields")
 DROPPED = Counter("capture_dropped_total", "Capture records dropped",
                   ["reason"])
 FLUSHES = Counter("capture_flush_total", "Conversation flushes", ["outcome"])

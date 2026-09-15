@@ -187,6 +187,25 @@ def _as_client_response(final: dict, wants_stream: bool):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+def _strip_sampling(body: bytes):
+    """(new_body, obj) with the client's sampling fields removed, or None when
+    there is nothing to remove or the body is not a JSON object."""
+    try:
+        obj = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    dropped = [k for k in config.STRIP_SAMPLING_FIELDS if k in obj]
+    if not dropped:
+        return None
+    for k in dropped:
+        del obj[k]
+    metrics.SAMPLING_STRIPPED.inc()
+    log.debug("sampling: dropped client fields %s", dropped)
+    return json.dumps(obj).encode("utf-8"), obj
+
+
 # -------------------------------------------------------------- the proxy
 @app.api_route("/{path:path}",
                methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD",
@@ -214,6 +233,21 @@ async def proxy(path: str, request: Request):
     elif endpoint in UNADAPTED:
         metrics.UNCAPTURED.labels(endpoint=endpoint).inc()
 
+    # Sampling belongs to the model server, not the client (see
+    # config.STRIP_SAMPLING). Dropped from what is FORWARDED only: `parsed`
+    # stays the client's own request, so the archive records what was sent,
+    # while `fwd` is what compaction and the tool loop build on.
+    fwd = parsed
+    if (config.STRIP_SAMPLING and endpoint in CHAT_PATHS
+            and request.method == "POST"
+            and (request.headers.get(config.HDR_CLIENT) or "").strip()
+            not in config.SAMPLING_KEEP_CLIENTS):
+        stripped = _strip_sampling(body)
+        if stripped is not None:
+            body, obj = stripped
+            if parsed is not None:
+                fwd = obj
+
     # Compaction happens after capture has its copy of the original request and
     # before anything is forwarded, so the archive records what the client sent
     # while the model receives something that fits. Any failure forwards the
@@ -222,7 +256,7 @@ async def proxy(path: str, request: Request):
     if parsed is not None:
         try:
             new_body, compaction = await request.app.state.compactor.maybe_compact(
-                parsed, request.headers.get("authorization") or "")
+                fwd, request.headers.get("authorization") or "")
         except Exception:
             log.exception("compact: unexpected failure; forwarding unchanged")
             new_body = None
@@ -235,7 +269,7 @@ async def proxy(path: str, request: Request):
     # own. The archive gets the whole loop, which the client never saw.
     if parsed is not None and config.TOOLS_ENABLED:
         auth = request.headers.get("authorization") or ""
-        loop_body = dict(new_body or parsed)
+        loop_body = dict(new_body or fwd)
         loop_body["messages"] = policy.apply(loop_body.get("messages") or [])
         sent = list(loop_body["messages"])
         # Where this request's mutations get announced. cluster-agent sends the

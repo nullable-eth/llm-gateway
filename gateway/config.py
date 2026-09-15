@@ -86,6 +86,26 @@ COMPACT_CACHE_MAX = int(os.environ.get("COMPACT_CACHE_MAX", "256"))
 # the server's reporting and the slot size ever disagree.
 COMPACT_N_CTX = int(os.environ.get("COMPACT_N_CTX", "0"))
 
+# ------------------------------------------------------------------ sampling
+# The model's sampling settings belong to the model, not to whichever chat
+# client happened to send the request. llama-server's --temp/--top-p/... are
+# only defaults, and Jan and Home Assistant both send their own values on every
+# request, so a tier tuned to its author's recommendations answered each client
+# differently. On, client sampling fields are dropped before forwarding and the
+# server's flags decide. The archive still records what the client sent.
+STRIP_SAMPLING = os.environ.get("GATEWAY_STRIP_SAMPLING", "0") not in ("0", "false", "no", "")
+STRIP_SAMPLING_FIELDS = tuple(f.strip() for f in os.environ.get(
+    "GATEWAY_STRIP_SAMPLING_FIELDS",
+    "temperature,top_p,top_k,min_p,typical_p,presence_penalty,"
+    "frequency_penalty,repeat_penalty,repetition_penalty,repeat_last_n,"
+    "dynatemp_range,dynatemp_exponent,mirostat,mirostat_tau,mirostat_eta,"
+    "xtc_probability,xtc_threshold").split(",") if f.strip())
+# Machine clients whose sampling is deliberate and kept: agentmemory's filing
+# classifier asks for temperature 0.1 and should get it. Same exact-match
+# allowlist rule as NOLOG_CLIENTS — an unrecognised name keeps nothing.
+SAMPLING_KEEP_CLIENTS = {c.strip() for c in os.environ.get(
+    "GATEWAY_SAMPLING_KEEP_CLIENTS", "agentmemory-filing").split(",") if c.strip()}
+
 # --------------------------------------------------------------------- tools
 # Always on where enabled, because the chat clients in play expose a fixed
 # api-key field and no way to send an extra header — per-request opt-in was
