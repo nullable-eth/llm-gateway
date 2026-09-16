@@ -24,7 +24,6 @@ tool credential is the intended next step — the blocker is that chat clients
 header, so the credential would have to ride the model name or a second port.
 """
 import asyncio
-import contextvars
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -57,7 +56,8 @@ READ_VERBS = {"get", "describe", "logs", "top", "api-resources", "api-versions",
 #
 # Everything else -- patch, apply, scale, cordon, drain, taint, delete, annotate
 # -- is allowed in auto mode and recorded as a proposal otherwise. Every one of
-# them announces itself to Discord before and after, which is the actual control.
+# them is reported before and after as a tool event on the response stream
+# (see dispatch), and the caller shows it: that visibility is the actual control.
 FORBIDDEN_VERBS = {"exec", "attach", "cp", "port-forward", "proxy", "debug",
                    "certificate", "config"}
 FORBIDDEN_SUBS = {"auth": {"can-i", "whoami"}}    # only these subcommands of auth
@@ -322,7 +322,7 @@ def is_mutation(name: str, args: dict) -> bool:
     """Does this call change something outside this process?
 
     Asked of every dispatch rather than maintained as a list of "dangerous
-    tools", so a tool added later is announced by default instead of being
+    tools", so a tool added later is reported as an action by default instead of being
     silently exempt until someone remembers to add it here.
     """
     if name in ("ha_call_service", "silence_alert", "git_open_pr"):
@@ -335,68 +335,33 @@ def is_mutation(name: str, args: dict) -> bool:
     return False
 
 
-# Set per request from X-Discord-Thread. A ContextVar rather than a parameter
-# because the thread belongs to the REQUEST, and threading it through the loop,
-# the dispatcher and every tool signature would put Discord in the type of code
-# that should not know Discord exists.
-ANNOUNCE_TO: contextvars.ContextVar[str] = contextvars.ContextVar("announce_to", default="")
+async def dispatch(name: str, args: dict, emit=None) -> str:
+    """Run a tool, reporting it before and after as a structured event.
 
-
-async def announce(text: str) -> None:
-    """Post an action to Discord. Never raises, never blocks the tool.
-
-    Bot only: the caller's incident thread, else DISCORD_CHANNEL_ID
-    (#cluster-alerts). If the thread post fails, the channel is tried. Every
-    post's status is checked: an HTTP error is a failure, not a success with a
-    body nobody reads (how a deleted webhook once swallowed every
-    chat-initiated action).
-    """
-    log.info("ACTION %s", text.replace("\n", " ")[:400])
-    body = {"content": text[:1900], "allowed_mentions": {"parse": []}}
-    targets = []
-    if config.DISCORD_BOT_TOKEN:
-        bot = {"Authorization": f"Bot {config.DISCORD_BOT_TOKEN}",
-               "User-Agent": "llm-gateway (actions, 1.0)"}
-        for channel, what in ((ANNOUNCE_TO.get(), "thread"),
-                              (config.DISCORD_CHANNEL_ID, "channel")):
-            if channel:
-                targets.append((what, f"https://discord.com/api/v10/channels/{channel}/messages", bot))
-    if not targets:
-        log.error("action NOT announced: no bot token or Discord channel configured")
-        return
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            for what, url, headers in targets:
-                try:
-                    r = await c.post(url, headers=headers, json=body)
-                except httpx.HTTPError as exc:
-                    log.warning("action post to %s failed: %s", what, type(exc).__name__)
-                    continue
-                if r.status_code < 300:
-                    return
-                log.warning("action post to %s failed: HTTP %s %s", what,
-                            r.status_code, r.text[:120].replace("\n", " "))
-        log.error("action NOT announced anywhere: %s", text[:200])
-    except Exception as exc:
-        log.warning("action post failed (continuing): %s", exc)
-
-
-async def dispatch(name: str, args: dict) -> str:
-    """Every mutation announces itself here, before and after.
-
-    Before, because a run that dies mid-change must still leave a record of what
-    it started; after, because "I ran this" and "this is what happened" are
-    different facts and the second one is the one worth reading. Refusals and
-    proposals are announced too: "the agent tried to do X and was stopped" is
+    Before, because a run that dies mid-change must still leave a record of
+    what it started; after, because "I ran this" and "this is what happened"
+    are different facts and the second is the one worth reading. Refusals and
+    proposals are reported too: "the agent tried to do X and was stopped" is
     exactly as interesting as "the agent did X".
+
+    The events go to `emit`, i.e. onto the caller's response stream as a
+    `tool_event` delta. Where they are shown (a chat window, the cluster-agent's
+    incident post) is the caller's business; the gateway knows nothing about
+    Discord. Every mutation is also logged here, whoever is listening.
     """
     mutating = is_mutation(name, args)
     if mutating:
-        await announce(f"**[cluster-agent] action** `{name}` {json.dumps(args)[:400]}")
+        log.info("ACTION %s %s", name, json.dumps(args)[:400])
+    if emit is not None:
+        await emit({"tool_event": {"phase": "call", "name": name, "args": args,
+                                   "mutating": mutating}})
     out = await _dispatch(name, args)
+    head = out.strip().splitlines()[0] if out.strip() else "(no output)"
     if mutating:
-        head = out.strip().splitlines()[0] if out.strip() else "(no output)"
-        await announce(f"**[cluster-agent] result** `{name}` -> {head[:400]}")
+        log.info("RESULT %s -> %s", name, head[:400])
+    if emit is not None:
+        await emit({"tool_event": {"phase": "result", "name": name, "mutating": mutating,
+                                   "summary": head[:400], "output": out[:2000]}})
     return out
 
 

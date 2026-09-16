@@ -312,7 +312,7 @@ async def run(client, upstream: str, body: dict, auth: str, compactor,
             name = (call.get("function") or {}).get("name") or ""
             if emit is not None:
                 await emit({"reasoning_content": _describe(name, _args_of(call))})
-            out = await tools.dispatch(name, _args_of(call))
+            out = await tools.dispatch(name, _args_of(call), emit)
             log.info("tool %s -> %d chars", name, len(out))
             messages.append({"role": "tool", "tool_call_id": call.get("id") or "",
                              "content": out})
