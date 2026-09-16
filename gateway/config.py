@@ -203,16 +203,13 @@ SILENCE_MAX_HOURS = int(os.environ.get("SILENCE_MAX_HOURS", "720"))
 # Where every mutation announces itself, as it happens. The condition on the
 # agent being allowed to change anything is that the change is visible: a report
 # minutes later is not visibility, and a run that dies mid-way would take its
-# only record with it. Empty means mutations are logged but not posted.
-DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
-# Preferred over the webhook when set: with the bot token, an action can be
-# announced INSIDE the incident thread the caller is working in (it passes the
-# thread id in X-Discord-Thread), so the change and the alert that caused it sit
-# in one place instead of two channels nobody reads together.
+# only record with it.
+#
+# BOT ONLY. Webhooks belong to Alertmanager (it posts the alerts); everything
+# the agent says goes through the bot, so it can post INSIDE the incident
+# thread the caller is working in (X-Discord-Thread) and otherwise into
+# DISCORD_CHANNEL_ID (#cluster-alerts). There is deliberately no webhook
+# fallback: a deleted webhook once swallowed every chat-initiated action
+# (404 Unknown Webhook, never checked) on 2026-09-15.
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
-# Where actions without an incident thread go (a chat client asking the agent
-# to do something). Posted with the bot token, same as thread posts. Preferred
-# over DISCORD_WEBHOOK, which is kept only as a last resort: a deleted webhook
-# is what made every chat-initiated action unannounced (404 Unknown Webhook,
-# never checked) on 2026-09-15.
 DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")

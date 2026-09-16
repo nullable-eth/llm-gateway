@@ -26,8 +26,8 @@ from .capture.writer import Writer
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("capture")
-# httpx logs every request URL at INFO. A Discord webhook URL is a credential,
-# and it was landing in the pod log on every announcement.
+# httpx logs every request URL at INFO: noise on the serving path, and it once
+# wrote a Discord webhook URL (a credential) into the pod log.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 CHAT_PATH = "/v1/chat/completions"
@@ -352,7 +352,7 @@ async def proxy(path: str, request: Request):
         sent = list(loop_body["messages"])
         # Where this request's mutations get announced. cluster-agent sends the
         # incident thread it is working in; a chat client sends nothing and the
-        # announcements fall back to the webhook (or to logs alone).
+        # announcements go to DISCORD_CHANNEL_ID.
         tools.ANNOUNCE_TO.set(request.headers.get("x-discord-thread", "") or "")
         wants_stream = bool(parsed.get("stream"))
         if wants_stream:

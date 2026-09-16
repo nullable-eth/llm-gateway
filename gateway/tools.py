@@ -345,11 +345,11 @@ ANNOUNCE_TO: contextvars.ContextVar[str] = contextvars.ContextVar("announce_to",
 async def announce(text: str) -> None:
     """Post an action to Discord. Never raises, never blocks the tool.
 
-    Order: the caller's incident thread, then the actions channel, both via the
-    bot; the webhook only if neither is available or both fail. Every post's
-    status is checked: an HTTP error is a failure, not a success with a body
-    nobody reads. That is how a deleted webhook silently swallowed every
-    chat-initiated action.
+    Bot only: the caller's incident thread, else DISCORD_CHANNEL_ID
+    (#cluster-alerts). If the thread post fails, the channel is tried. Every
+    post's status is checked: an HTTP error is a failure, not a success with a
+    body nobody reads (how a deleted webhook once swallowed every
+    chat-initiated action).
     """
     log.info("ACTION %s", text.replace("\n", " ")[:400])
     body = {"content": text[:1900], "allowed_mentions": {"parse": []}}
@@ -361,10 +361,8 @@ async def announce(text: str) -> None:
                               (config.DISCORD_CHANNEL_ID, "channel")):
             if channel:
                 targets.append((what, f"https://discord.com/api/v10/channels/{channel}/messages", bot))
-    if config.DISCORD_WEBHOOK:
-        targets.append(("webhook", config.DISCORD_WEBHOOK, {}))
     if not targets:
-        log.warning("action not announced: no Discord destination configured")
+        log.error("action NOT announced: no bot token or Discord channel configured")
         return
     try:
         async with httpx.AsyncClient(timeout=10) as c:
@@ -376,7 +374,6 @@ async def announce(text: str) -> None:
                     continue
                 if r.status_code < 300:
                     return
-                # Never log the URL: a webhook URL is a credential.
                 log.warning("action post to %s failed: HTTP %s %s", what,
                             r.status_code, r.text[:120].replace("\n", " "))
         log.error("action NOT announced anywhere: %s", text[:200])
