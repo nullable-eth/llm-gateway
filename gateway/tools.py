@@ -343,42 +343,36 @@ ANNOUNCE_TO: contextvars.ContextVar[str] = contextvars.ContextVar("announce_to",
 
 
 async def announce(text: str) -> None:
-    """Post an action to Discord. Never raises, never blocks the tool.
+    """Post an action to the caller's incident post. Never raises or blocks.
 
-    Bot only: the caller's incident thread, else DISCORD_CHANNEL_ID
-    (#cluster-alerts). If the thread post fails, the channel is tried. Every
-    post's status is checked: an HTTP error is a failure, not a success with a
+    Bot only, and only into the post named by X-Discord-Thread: the
+    cluster-agent opens one forum post per alert and every action for that
+    alert belongs inside it. A request without a thread is an interactive
+    chat, whose actions stream back to the person asking, so there is nowhere
+    else to post them (and a forum channel cannot take plain messages anyway).
+    The status is checked: an HTTP error is a failure, not a success with a
     body nobody reads (how a deleted webhook once swallowed every
     chat-initiated action).
     """
     log.info("ACTION %s", text.replace("\n", " ")[:400])
-    body = {"content": text[:1900], "allowed_mentions": {"parse": []}}
-    targets = []
-    if config.DISCORD_BOT_TOKEN:
-        bot = {"Authorization": f"Bot {config.DISCORD_BOT_TOKEN}",
-               "User-Agent": "llm-gateway (actions, 1.0)"}
-        for channel, what in ((ANNOUNCE_TO.get(), "thread"),
-                              (config.DISCORD_CHANNEL_ID, "channel")):
-            if channel:
-                targets.append((what, f"https://discord.com/api/v10/channels/{channel}/messages", bot))
-    if not targets:
-        log.error("action NOT announced: no bot token or Discord channel configured")
+    thread = ANNOUNCE_TO.get()
+    if not thread:
         return
+    if not config.DISCORD_BOT_TOKEN:
+        log.error("action NOT announced: no Discord bot token configured")
+        return
+    body = {"content": text[:1900], "allowed_mentions": {"parse": []}}
+    headers = {"Authorization": f"Bot {config.DISCORD_BOT_TOKEN}",
+               "User-Agent": "llm-gateway (actions, 1.0)"}
+    url = f"https://discord.com/api/v10/channels/{thread}/messages"
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            for what, url, headers in targets:
-                try:
-                    r = await c.post(url, headers=headers, json=body)
-                except httpx.HTTPError as exc:
-                    log.warning("action post to %s failed: %s", what, type(exc).__name__)
-                    continue
-                if r.status_code < 300:
-                    return
-                log.warning("action post to %s failed: HTTP %s %s", what,
-                            r.status_code, r.text[:120].replace("\n", " "))
-        log.error("action NOT announced anywhere: %s", text[:200])
+            r = await c.post(url, headers=headers, json=body)
+        if r.status_code >= 300:
+            log.error("action NOT announced: HTTP %s %s", r.status_code,
+                      r.text[:120].replace("\n", " "))
     except Exception as exc:
-        log.warning("action post failed (continuing): %s", exc)
+        log.warning("action post failed (continuing): %s", type(exc).__name__)
 
 
 async def dispatch(name: str, args: dict) -> str:

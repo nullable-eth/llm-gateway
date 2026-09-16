@@ -205,11 +205,10 @@ SILENCE_MAX_HOURS = int(os.environ.get("SILENCE_MAX_HOURS", "720"))
 # minutes later is not visibility, and a run that dies mid-way would take its
 # only record with it.
 #
-# BOT ONLY. Webhooks belong to Alertmanager (it posts the alerts); everything
-# the agent says goes through the bot, so it can post INSIDE the incident
-# thread the caller is working in (X-Discord-Thread) and otherwise into
-# DISCORD_CHANNEL_ID (#cluster-alerts). There is deliberately no webhook
-# fallback: a deleted webhook once swallowed every chat-initiated action
-# (404 Unknown Webhook, never checked) on 2026-09-15.
+# BOT ONLY, and only INSIDE the incident post the caller is working in
+# (X-Discord-Thread; the cluster-agent opens one forum post per alert).
+# Interactive chats have no post: their actions stream back to the person
+# asking. There is deliberately no webhook and no channel fallback: a deleted
+# webhook once swallowed every chat-initiated action (2026-09-15), and a forum
+# channel cannot take plain messages.
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
-DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")

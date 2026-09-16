@@ -776,54 +776,48 @@ async def run_all():
           gtools.is_mutation("run_kubectl", {"args": ["rollout", "restart", "deploy/x"]}))
     check("silencing is an action", gtools.is_mutation("silence_alert", {}))
 
-    # Where an action is announced: the incident thread when the caller names
-    # one, the webhook otherwise. Getting this wrong means the operator reads
-    # "I deleted a pod" in a channel with no alert attached to it.
+    # Where an action is announced: inside the incident post the caller names,
+    # and nowhere else. Getting this wrong means the operator reads "I deleted
+    # a pod" somewhere with no alert attached to it.
     posted: list[tuple] = []
+    status = {"code": 200}
+    class _Resp:
+        def __init__(self): self.status_code, self.text = status["code"], "Unknown Channel"
     class _FakeC:
         def __init__(self, *a, **k): pass
         async def __aenter__(self): return self
         async def __aexit__(self, *a): return False
-        async def post(self, url, **kw): posted.append((url, kw.get("json", {}).get("content", "")))
-    real_httpx, gtools.httpx.AsyncClient = gtools.httpx.AsyncClient, _FakeC
-    real_tok, gcfg.DISCORD_BOT_TOKEN = gcfg.DISCORD_BOT_TOKEN, "tok"
-    real_chan, gcfg.DISCORD_CHANNEL_ID = gcfg.DISCORD_CHANNEL_ID, "4242"
-    status = {"code": 200}
-    class _Resp:
-        def __init__(self): self.status_code, self.text = status["code"], "Unknown Channel"
-    class _FakeC2(_FakeC):
         async def post(self, url, **kw):
             posted.append((url, kw.get("json", {}).get("content", ""), kw.get("headers") or {}))
             return _Resp()
-    gtools.httpx.AsyncClient = _FakeC2
+    real_httpx, gtools.httpx.AsyncClient = gtools.httpx.AsyncClient, _FakeC
+    real_tok, gcfg.DISCORD_BOT_TOKEN = gcfg.DISCORD_BOT_TOKEN, "tok"
     try:
         gtools.ANNOUNCE_TO.set("998877")
         await gtools.announce("did a thing")
-        check("with a thread, the action lands in that thread, via the bot",
+        check("with a thread, the action lands in that post, via the bot",
               len(posted) == 1 and "/channels/998877/messages" in posted[0][0]
               and posted[0][2].get("Authorization") == "Bot tok", str(posted))
         gtools.ANNOUNCE_TO.set("")
         n = len(posted)
         await gtools.announce("chat action")
-        check("without a thread, the bot posts to #cluster-alerts (DISCORD_CHANNEL_ID)",
-              [u for u, *_ in posted[n:]] == ["https://discord.com/api/v10/channels/4242/messages"],
-              str(posted[n:]))
+        check("without a thread (interactive chat), nothing is posted anywhere",
+              posted[n:] == [], str(posted[n:]))
         status["code"] = 404
         gtools.ANNOUNCE_TO.set("998877")
         n = len(posted)
         await gtools.announce("thread is broken")
-        check("a failed thread post (HTTP 404) falls back to the channel, still via the bot",
-              [u for u, *_ in posted[n:]] == ["https://discord.com/api/v10/channels/998877/messages",
-                                              "https://discord.com/api/v10/channels/4242/messages"],
+        check("a failed post is not retried somewhere else",
+              [u for u, *_ in posted[n:]] == ["https://discord.com/api/v10/channels/998877/messages"],
               str(posted[n:]))
         check("nothing ever goes to a webhook",
               not any("webhooks" in u for u, *_ in posted), str(posted))
-        check("the webhook setting no longer exists", not hasattr(gcfg, "DISCORD_WEBHOOK"))
+        check("there is no channel or webhook fallback setting",
+              not hasattr(gcfg, "DISCORD_WEBHOOK") and not hasattr(gcfg, "DISCORD_CHANNEL_ID"))
         gtools.ANNOUNCE_TO.set("")
     finally:
         gtools.httpx.AsyncClient = real_httpx
         gcfg.DISCORD_BOT_TOKEN = real_tok
-        gcfg.DISCORD_CHANNEL_ID = real_chan
     said: list[str] = []
     async def _say(t): said.append(t)
     real_say, gtools.announce = gtools.announce, _say
