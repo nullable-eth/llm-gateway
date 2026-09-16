@@ -776,61 +776,26 @@ async def run_all():
           gtools.is_mutation("run_kubectl", {"args": ["rollout", "restart", "deploy/x"]}))
     check("silencing is an action", gtools.is_mutation("silence_alert", {}))
 
-    # Where an action is announced: inside the incident post the caller names,
-    # and nowhere else. Getting this wrong means the operator reads "I deleted
-    # a pod" somewhere with no alert attached to it.
-    posted: list[tuple] = []
-    status = {"code": 200}
-    class _Resp:
-        def __init__(self): self.status_code, self.text = status["code"], "Unknown Channel"
-    class _FakeC:
-        def __init__(self, *a, **k): pass
-        async def __aenter__(self): return self
-        async def __aexit__(self, *a): return False
-        async def post(self, url, **kw):
-            posted.append((url, kw.get("json", {}).get("content", ""), kw.get("headers") or {}))
-            return _Resp()
-    real_httpx, gtools.httpx.AsyncClient = gtools.httpx.AsyncClient, _FakeC
-    real_tok, gcfg.DISCORD_BOT_TOKEN = gcfg.DISCORD_BOT_TOKEN, "tok"
-    try:
-        gtools.ANNOUNCE_TO.set("998877")
-        await gtools.announce("did a thing")
-        check("with a thread, the action lands in that post, via the bot",
-              len(posted) == 1 and "/channels/998877/messages" in posted[0][0]
-              and posted[0][2].get("Authorization") == "Bot tok", str(posted))
-        gtools.ANNOUNCE_TO.set("")
-        n = len(posted)
-        await gtools.announce("chat action")
-        check("without a thread (interactive chat), nothing is posted anywhere",
-              posted[n:] == [], str(posted[n:]))
-        status["code"] = 404
-        gtools.ANNOUNCE_TO.set("998877")
-        n = len(posted)
-        await gtools.announce("thread is broken")
-        check("a failed post is not retried somewhere else",
-              [u for u, *_ in posted[n:]] == ["https://discord.com/api/v10/channels/998877/messages"],
-              str(posted[n:]))
-        check("nothing ever goes to a webhook",
-              not any("webhooks" in u for u, *_ in posted), str(posted))
-        check("there is no channel or webhook fallback setting",
-              not hasattr(gcfg, "DISCORD_WEBHOOK") and not hasattr(gcfg, "DISCORD_CHANNEL_ID"))
-        gtools.ANNOUNCE_TO.set("")
-    finally:
-        gtools.httpx.AsyncClient = real_httpx
-        gcfg.DISCORD_BOT_TOKEN = real_tok
-    said: list[str] = []
-    async def _say(t): said.append(t)
-    real_say, gtools.announce = gtools.announce, _say
-    try:
-        await gtools.dispatch("run_kubectl", {"args": ["get", "pods", "-n", "ai"]})
-        check("a read announces nothing", said == [], str(said))
-        await gtools.dispatch("run_kubectl", {"args": ["delete", "pod", "nope-does-not-exist"]})
-        check("a mutation announces before and after", len(said) == 2, str(said))
-        check("the attempt is announced even when it is refused",
-              said and "action" in said[0] and "delete" in said[0], str(said))
-        check("and the outcome is announced separately", said and "result" in said[-1], str(said))
-    finally:
-        gtools.announce = real_say
+    # Every tool call is reported on the stream as a structured event, before
+    # and after, marked when it changes something. The caller decides where to
+    # show it; the gateway knows nothing about Discord.
+    check("the gateway has no Discord settings",
+          not any(k.startswith("DISCORD") for k in vars(gcfg)))
+    check("and no announcer", not hasattr(gtools, "announce") and not hasattr(gtools, "ANNOUNCE_TO"))
+    said: list[dict] = []
+    async def _emit(d): said.append(d["tool_event"])
+    await gtools.dispatch("run_kubectl", {"args": ["get", "pods", "-n", "ai"]}, _emit)
+    check("a read is reported as a non-mutating call and result",
+          [(e["phase"], e["mutating"]) for e in said] == [("call", False), ("result", False)], str(said))
+    said.clear()
+    await gtools.dispatch("run_kubectl", {"args": ["delete", "pod", "nope-does-not-exist"]}, _emit)
+    check("a mutation is reported before and after, marked mutating",
+          [(e["phase"], e["mutating"]) for e in said] == [("call", True), ("result", True)], str(said))
+    check("the attempt carries its arguments even when it is refused",
+          said and said[0]["args"] == {"args": ["delete", "pod", "nope-does-not-exist"]}, str(said))
+    check("and the outcome carries a summary", said and said[-1].get("summary"), str(said))
+    check("without a listener, dispatch still runs",
+          isinstance(await gtools.dispatch("run_kubectl", {"args": ["get", "ns"]}), str))
     async def _fake_ctx(u, r=3):
         return f"WINDOW around {u} radius {r}"
     real_ctx, gtools.get_context = gtools.get_context, _fake_ctx
@@ -923,6 +888,13 @@ async def run_all():
               "look at the pods first" in thinking and "only pod" in thinking, thinking)
         check("each tool call is announced inside the thinking",
               "[tool] run_kubectl: kubectl get pods -n media" in thinking, thinking)
+        events = [o["choices"][0]["delta"]["tool_event"] for _, o in frames
+                  if o.get("choices") and o["choices"][0]["delta"].get("tool_event")]
+        check("each tool call streams as a structured call + result event",
+              [(e["phase"], e["name"]) for e in events]
+              == [("call", "run_kubectl"), ("result", "run_kubectl")]
+              and events[0]["args"] == {"args": ["get", "pods", "-n", "media"]}
+              and not events[0]["mutating"], str(events))
         check("the answer is streamed and complete",
               answer == "One pod runs in media: jellyfin-0.", repr(answer))
         r_times = [t for t, o in frames if o.get("choices")
@@ -1080,17 +1052,15 @@ async def run_git():
               "#1" in await git.list_prs("Whitehorse"))
 
         said = []
-        async def _say(t): said.append(t)
-        real_say, gtools.announce = gtools.announce, _say
-        try:
-            await gtools.dispatch("git_read_file", {"repo": "Whitehorse", "path": "README.md"})
-            check("a read announces nothing", said == [], str(said))
-            await gtools.dispatch("git_open_pr", {"repo": "Whitehorse", "title": "chore: announce test",
-                                  "body": "b", "changes": [{"path": "x.md", "content": "x"}]})
-            check("opening a PR is announced like any other action",
-                  len(said) == 2 and "git_open_pr" in said[0] and "opened PR" in said[1], str(said))
-        finally:
-            gtools.announce = real_say
+        async def _emit(d): said.append(d["tool_event"])
+        await gtools.dispatch("git_read_file", {"repo": "Whitehorse", "path": "README.md"}, _emit)
+        check("a git read is not a mutation", not any(e["mutating"] for e in said), str(said))
+        said.clear()
+        await gtools.dispatch("git_open_pr", {"repo": "Whitehorse", "title": "chore: announce test",
+                              "body": "b", "changes": [{"path": "x.md", "content": "x"}]}, _emit)
+        check("opening a PR is reported like any other action",
+              len(said) == 2 and all(e["mutating"] for e in said)
+              and said[0]["name"] == "git_open_pr" and "opened PR" in said[1]["summary"], str(said))
         check("the token never appears in any output",
               not any("ghtest" in str(v) for v in (out, said)))
     finally:

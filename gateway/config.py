@@ -200,15 +200,3 @@ MEMORY_SEARCH_MAX_K = int(os.environ.get("MEMORY_SEARCH_MAX_K", "50"))
 # outliving its reason: 30 days, and the default is a week.
 ALERTMANAGER_URL = os.environ.get("ALERTMANAGER_URL", "").rstrip("/")
 SILENCE_MAX_HOURS = int(os.environ.get("SILENCE_MAX_HOURS", "720"))
-# Where every mutation announces itself, as it happens. The condition on the
-# agent being allowed to change anything is that the change is visible: a report
-# minutes later is not visibility, and a run that dies mid-way would take its
-# only record with it.
-#
-# BOT ONLY, and only INSIDE the incident post the caller is working in
-# (X-Discord-Thread; the cluster-agent opens one forum post per alert).
-# Interactive chats have no post: their actions stream back to the person
-# asking. There is deliberately no webhook and no channel fallback: a deleted
-# webhook once swallowed every chat-initiated action (2026-09-15), and a forum
-# channel cannot take plain messages.
-DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")

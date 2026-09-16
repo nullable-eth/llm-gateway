@@ -350,10 +350,6 @@ async def proxy(path: str, request: Request):
         loop_body = dict(new_body or fwd)
         loop_body["messages"] = policy.apply(loop_body.get("messages") or [])
         sent = list(loop_body["messages"])
-        # Where this request's mutations get announced. cluster-agent sends the
-        # incident post it is working in; a chat client sends nothing, and its
-        # actions are only what streams back to the person asking.
-        tools.ANNOUNCE_TO.set(request.headers.get("x-discord-thread", "") or "")
         wants_stream = bool(parsed.get("stream"))
         if wants_stream:
             def on_done(final, produced):
