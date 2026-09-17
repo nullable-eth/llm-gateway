@@ -55,7 +55,10 @@ def is_mutation(name: str, args: dict) -> bool:
     """
     client = mcpclient.get()
     ann = client.annotations(name) if client else {}
-    return ann.get("readOnlyHint") is not True
+    if "readOnlyHint" in ann:
+        return ann["readOnlyHint"] is not True
+    # For servers that do not annotate: names the operator vouches for.
+    return not (config.TOOL_READ_ONLY_RE and config.TOOL_READ_ONLY_RE.search(name))
 
 
 async def dispatch(name: str, args: dict, emit=None) -> str:

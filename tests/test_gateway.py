@@ -648,6 +648,16 @@ async def run_all():
     check("a destructive tool is an action", gtools.is_mutation("kubernetes_pods_delete", {}))
     check("an unannotated tool is reported as an action, not exempt",
           gtools.is_mutation("github_push_files", {}))
+    import re as _re
+    was_re, gcfg.TOOL_READ_ONLY_RE = gcfg.TOOL_READ_ONLY_RE, _re.compile("^github_(get|push)_")
+    try:
+        check("an unannotated tool the operator names as read-only is not an action",
+              not gtools.is_mutation("github_push_files", {}))
+        gcfg.TOOL_READ_ONLY_RE = _re.compile("^kubernetes_")
+        check("but a tool's own annotation wins over the pattern",
+              gtools.is_mutation("kubernetes_pods_delete", {}))
+    finally:
+        gcfg.TOOL_READ_ONLY_RE = was_re
 
     # An empty finish() is not an answer. A phone client asked a question, the
     # model ran a tool, then ended its turn with nothing in the report and the

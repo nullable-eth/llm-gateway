@@ -4,6 +4,7 @@ Deliberately standalone: app/config.py requires PG_DSN at import time and the
 sidecar has no business holding a database DSN.
 """
 import os
+import re
 
 UPSTREAM = os.environ.get("GATEWAY_UPSTREAM", "http://127.0.0.1:8000").rstrip("/")
 VAULT_ROOT = os.environ.get("VAULT_ROOT", "/vault")
@@ -176,5 +177,10 @@ def mcp_token() -> str:
 MCP_CALL_TIMEOUT_S = float(os.environ.get("MCP_CALL_TIMEOUT_S", "120"))
 # How long a tools/list is reused. New or removed tools appear within this.
 MCP_TOOLS_TTL_S = float(os.environ.get("MCP_TOOLS_TTL_S", "60"))
+# Tools with no readOnlyHint annotation are reported as actions. This regex
+# names the unannotated ones that only read (e.g. "^flux_(get|search)_"); a
+# tool's own annotation always wins.
+TOOL_READ_ONLY_PATTERN = os.environ.get("TOOL_READ_ONLY_PATTERN", "")
+TOOL_READ_ONLY_RE = re.compile(TOOL_READ_ONLY_PATTERN) if TOOL_READ_ONLY_PATTERN else None
 # The endpoint's own instructions are appended to the tool policy, capped.
 MCP_INSTRUCTIONS_MAX = int(os.environ.get("MCP_INSTRUCTIONS_MAX", "4000"))

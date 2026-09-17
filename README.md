@@ -101,6 +101,7 @@ inference key may do, and restrict who can reach the model port.
 | `MCP_TOKEN_FILE` / `MCP_TOKEN` | `/var/run/secrets/mcp/token` / *(empty)* | Bearer token for the endpoint, if it wants one. The file is re-read on change |
 | `MCP_CALL_TIMEOUT_S` | `120` | One tool call's limit |
 | `MCP_TOOLS_TTL_S` | `60` | How long a `tools/list` is reused |
+| `TOOL_READ_ONLY_PATTERN` | *(empty)* | Regex of tool names to report as reads when the server does not annotate them (`readOnlyHint` always wins) |
 | `MCP_INSTRUCTIONS_MAX` | `4000` | Cap on the endpoint instructions appended to the policy |
 | `TOOL_MAX_STEPS` | `40` | Model+tool round trips before it must answer |
 | `TOOL_MAX_SECONDS` | `1200` | Wall-clock budget for starting new tool work; past it the tools are withdrawn |
