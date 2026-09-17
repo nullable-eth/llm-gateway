@@ -5,9 +5,11 @@ only watches a copy. Authorization is forwarded verbatim and never inspected,
 so llama.cpp keeps enforcing LLAMA_API_KEY exactly as it does today — the
 proxy holds no key and can grant no access.
 
-Accept-Encoding is dropped on the way up so the response arrives as identity.
-Over a loopback hop into a sidecar that costs nothing, and it means the tee
-reads plaintext instead of having to decompress a copy of every stream.
+Encoding: requests the gateway captures (chat) ask upstream for identity, so
+the tee reads plaintext. Everything else (llama.cpp's web UI, which it only
+serves gzipped) passes the client's Accept-Encoding through, and the response
+keeps its Content-Encoding: the body is relayed raw, so dropping that header
+handed browsers gzip bytes as if they were HTML (2026-09-17).
 """
 import httpx
 
@@ -17,7 +19,7 @@ HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate",
               "proxy-authorization", "te", "trailer", "transfer-encoding",
               "upgrade"}
 DROP_UP = HOP_BY_HOP | {"host", "content-length", "accept-encoding"}
-DROP_DOWN = HOP_BY_HOP | {"content-length", "content-encoding"}
+DROP_DOWN = HOP_BY_HOP | {"content-length"}
 
 
 def client() -> httpx.AsyncClient:
@@ -29,8 +31,11 @@ def client() -> httpx.AsyncClient:
         follow_redirects=False)
 
 
-def upstream_headers(headers) -> dict:
-    return {k: v for k, v in headers.items() if k.lower() not in DROP_UP}
+def upstream_headers(headers, pass_encoding: bool = False) -> dict:
+    out = {k: v for k, v in headers.items() if k.lower() not in DROP_UP}
+    # Explicit, or httpx adds its own "gzip, deflate" and the tee gets gzip.
+    out["accept-encoding"] = (headers.get("accept-encoding") or "identity") if pass_encoding else "identity"
+    return out
 
 
 def downstream_headers(headers) -> dict:

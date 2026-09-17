@@ -31,7 +31,7 @@ import subprocess
 
 import httpx
 
-from . import config, gittools
+from . import config, gittools, observe
 
 log = logging.getLogger("gateway")
 
@@ -58,7 +58,7 @@ READ_VERBS = {"get", "describe", "logs", "top", "api-resources", "api-versions",
 # -- is allowed in auto mode and recorded as a proposal otherwise. Every one of
 # them is reported before and after as a tool event on the response stream
 # (see dispatch), and the caller shows it: that visibility is the actual control.
-FORBIDDEN_VERBS = {"exec", "attach", "cp", "port-forward", "proxy", "debug",
+FORBIDDEN_VERBS = {"exec", "attach", "cp", "port-forward", "proxy", "debug", "alpha", "plugin",
                    "certificate", "config"}
 FORBIDDEN_SUBS = {"auth": {"can-i", "whoami"}}    # only these subcommands of auth
 FORBIDDEN_TOKENS = {"--token", "--kubeconfig", "--as", "--as-group", "--as-uid"}
@@ -69,18 +69,49 @@ FORBIDDEN_RESOURCES = {"secret", "secrets", "serviceaccount", "serviceaccounts",
                        "certificatesigningrequests"}
 
 
+# Global flags that may come before the verb, and which of them take a value
+# as the next argument. Anything else before the verb is refused: kubectl
+# accepts flags anywhere, and a guard that only looked at argv[0] let
+# `-n media exec ...` through (2026-09-17; RBAC refused it underneath).
+PRE_VERB_VALUE_FLAGS = {"-n", "--namespace", "--context", "--cluster", "--user",
+                        "--request-timeout", "-v", "--v"}
+PRE_VERB_BOOL_FLAGS = {"--insecure-skip-tls-verify", "--match-server-version",
+                       "--warnings-as-errors", "--disable-compression"}
+
+
+def split_verb(low: list[str]) -> tuple[str | None, list[str], str | None]:
+    """(verb, args from the verb on, error). Flags before the verb are skipped
+    only if they are known global flags; anything else is an error."""
+    i = 0
+    while i < len(low):
+        tok = low[i]
+        if not tok.startswith("-"):
+            return tok, low[i:], None
+        name = tok.split("=", 1)[0]
+        if name in PRE_VERB_VALUE_FLAGS:
+            i += 1 if "=" in tok else 2
+        elif name in PRE_VERB_BOOL_FLAGS:
+            i += 1
+        else:
+            return None, [], (f"'{tok}' before the command is not permitted; "
+                              f"put flags after the verb (e.g. get pods -n media)")
+    return None, [], "no kubectl command given"
+
+
 def kubectl_guard(args: list[str]) -> str | None:
     """Return a rejection reason, or None if the command may run."""
     if not args:
         return "empty command"
-    low = [a.lower() for a in args]
-    verb = low[0]
+    everything = [a.lower() for a in args]
+    verb, low, err = split_verb(everything)
+    if err:
+        return err
     if verb in FORBIDDEN_VERBS:
         return (f"'{verb}' is never permitted: it opens a shell or tunnel into a "
                 f"workload, which is a bigger claim than any alert justifies")
     if verb in FORBIDDEN_SUBS and (len(low) < 2 or low[1] not in FORBIDDEN_SUBS[verb]):
         return f"'{verb}' is only permitted as: {' | '.join(sorted(FORBIDDEN_SUBS[verb]))}"
-    for tok in low:
+    for tok in everything:
         if tok.split("=")[0] in FORBIDDEN_TOKENS:
             return f"'{tok}' is never permitted: the agent acts as itself or not at all"
     for tok in low[1:]:
@@ -90,7 +121,7 @@ def kubectl_guard(args: list[str]) -> str | None:
                     f"not runtime state (and are absent from this RBAC anyway)")
     is_read = verb in READ_VERBS and low[0:2] != ["rollout", "restart"]
     for name in config.PROTECTED:
-        if any(name in t for t in low[1:]) and not is_read:
+        if any(name in t for t in everything) and not is_read:
             return f"target matches protected component '{name}' — self-preservation rule"
     if is_read:
         return None
@@ -315,7 +346,8 @@ TOOLS = [
 def offered() -> list:
     """The tools handed to the model on this call. Git tools only when a
     token exists, so an unconfigured gateway does not advertise dead tools."""
-    return TOOLS + (gittools.TOOLS if config.git_token() else [])
+    return (TOOLS + (observe.TOOLS if config.PROMETHEUS_URL or config.ALERTMANAGER_URL else [])
+            + (gittools.TOOLS if config.git_token() else []))
 
 
 def is_mutation(name: str, args: dict) -> bool:
@@ -328,10 +360,10 @@ def is_mutation(name: str, args: dict) -> bool:
     if name in ("ha_call_service", "silence_alert", "git_open_pr"):
         return True
     if name == "run_kubectl":
-        argv = [str(a).lower() for a in (args.get("args") or [])]
-        if not argv:
-            return False
-        return argv[0] not in READ_VERBS or argv[:2] == ["rollout", "restart"]
+        verb, argv, err = split_verb([str(a).lower() for a in (args.get("args") or [])])
+        if err or not verb:
+            return True             # refused anyway; report the attempt
+        return verb not in READ_VERBS or argv[:2] == ["rollout", "restart"]
     return False
 
 
@@ -370,6 +402,8 @@ async def _dispatch(name: str, args: dict) -> str:
         return await asyncio.to_thread(run_kubectl, args.get("args", []))
     if name in gittools.NAMES:
         return await gittools.dispatch(name, args)
+    if name in observe.NAMES:
+        return await observe.dispatch(name, args)
     if name == "ha_get_states":
         return await ha_get_states(args.get("entity_id", ""))
     if name == "ha_call_service":

@@ -141,6 +141,67 @@ async def completions(request: Request):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+# --- llama.cpp's web UI, which it only serves gzipped ------------------------
+import gzip as _gz
+UI_HTML = b"<!doctype html><title>llama.cpp</title>"
+
+
+@fake.get("/")
+async def ui(request: Request):
+    from fastapi.responses import Response, PlainTextResponse
+    if "gzip" not in (request.headers.get("accept-encoding") or ""):
+        return PlainTextResponse("Error: gzip is not supported by this browser")
+    return Response(_gz.compress(UI_HTML), media_type="text/html",
+                    headers={"Content-Encoding": "gzip"})
+
+
+SEEN_AE: list = []
+
+
+@fake.middleware("http")
+async def _record_ae(request: Request, call_next):
+    if request.url.path == "/v1/chat/completions":
+        SEEN_AE.append(request.headers.get("accept-encoding"))
+    return await call_next(request)
+
+
+# --- a fake Prometheus and Alertmanager (read-only tools) --------------------
+@fake.get("/prom/api/v1/query")
+async def prom_query(query: str):
+    if query == "bad(":
+        return JSONResponse({"status": "error", "errorType": "bad_data", "error": "parse error"}, 400)
+    return {"status": "success", "data": {"resultType": "vector", "result": [
+        {"metric": {"__name__": "up", "job": "kube-state-metrics"}, "value": [1, "1"]},
+        {"metric": {"__name__": "up", "job": "node"}, "value": [1, "0"]}]}}
+
+
+@fake.get("/prom/api/v1/query_range")
+async def prom_range(query: str, start: float, end: float, step: str):
+    t = int(start)
+    return {"status": "success", "data": {"resultType": "matrix", "result": [
+        {"metric": {"pod": "shared-pg-3"},
+         "values": [[t, "0"], [t + 60, "0"], [t + 120, "3"], [t + 180, "8"]]}]}}
+
+
+@fake.get("/am/api/v2/alerts")
+async def am_alerts():
+    return [{"labels": {"alertname": "KubePodCrashLooping", "namespace": "databases"},
+             "annotations": {"summary": "Pod is crash looping."},
+             "startsAt": "2026-09-16T21:51:00Z",
+             "status": {"state": "active", "silencedBy": [], "inhibitedBy": []}},
+            {"labels": {"alertname": "NodeBondingDegraded"}, "annotations": {},
+             "startsAt": "2026-09-16T19:00:00Z",
+             "status": {"state": "suppressed", "silencedBy": ["s1"], "inhibitedBy": []}}]
+
+
+@fake.get("/am/api/v2/silences")
+async def am_silences():
+    return [{"id": "s1", "status": {"state": "active"}, "endsAt": "2026-09-23T19:53:07Z",
+             "createdBy": "cluster-agent", "comment": "operator said ignore",
+             "matchers": [{"name": "alertname", "value": "NodeBondingDegraded"}]},
+            {"id": "s0", "status": {"state": "expired"}, "matchers": []}]
+
+
 # --- a fake GitHub, just the REST calls gittools makes ---------------------
 import hashlib as _hl
 
@@ -688,6 +749,26 @@ async def run_all():
           gtools.kubectl_guard(["get", "secrets"]) is not None)
     check("guard refuses exec",
           gtools.kubectl_guard(["exec", "-it", "pod"]) is not None)
+    # The 2026-09-17 bypass: flags before the verb hid it from the guard.
+    for argv in (["-n", "media", "exec", "deploy/x", "--", "sh"],
+                 ["--namespace=media", "exec", "deploy/x"],
+                 ["--context", "c", "-n", "ai", "attach", "p"],
+                 ["-n", "x", "debug", "node/n"],
+                 ["alpha", "debug", "p"],
+                 ["--kubeconfig=/tmp/k", "get", "pods"],
+                 ["--some-flag", "get", "pods"],
+                 ["-n", "media"]):
+        check(f"guard refuses {' '.join(argv)}", gtools.kubectl_guard(argv) is not None,
+              str(gtools.kubectl_guard(argv)))
+    check("guard allows a namespace flag before a read",
+          gtools.kubectl_guard(["-n", "media", "get", "pods"]) is None,
+          str(gtools.kubectl_guard(["-n", "media", "get", "pods"])))
+    check("secrets are refused even behind a namespace flag",
+          gtools.kubectl_guard(["-n", "media", "get", "secrets"]) is not None)
+    check("a write behind a namespace flag counts as a mutation",
+          gtools.is_mutation("run_kubectl", {"args": ["-n", "media", "delete", "pod", "p"]}))
+    check("a read behind a namespace flag is not a mutation",
+          not gtools.is_mutation("run_kubectl", {"args": ["-n", "media", "get", "pods"]}))
     check("guard refuses acting on a protected component",
           gtools.kubectl_guard(["rollout", "restart", "deploy/llm-expert"]) is not None)
     check("guard refuses mutations in propose mode",
@@ -1067,6 +1148,85 @@ async def run_git():
         gcfg.GIT_TOKEN, gcfg.GIT_API = saved
 
 
+async def run_observe_and_proxy() -> None:
+    AUTH = {"Authorization": "Bearer testkey"}
+    print("\n[observe] read-only Prometheus / Alertmanager tools")
+    import gateway.config as gcfg
+    import gateway.tools as gtools
+    saved = (gcfg.PROMETHEUS_URL, gcfg.ALERTMANAGER_URL)
+    gcfg.PROMETHEUS_URL = "http://127.0.0.1:18000/prom"
+    gcfg.ALERTMANAGER_URL = "http://127.0.0.1:18000/am"
+    try:
+        names = {t["function"]["name"] for t in gtools.offered()}
+        check("the read-only tools are offered",
+              {"prometheus_query", "prometheus_query_range", "list_alerts", "list_silences"} <= names, names)
+        for n in ("prometheus_query", "prometheus_query_range", "list_alerts", "list_silences"):
+            check(f"{n} is not an action", not gtools.is_mutation(n, {}))
+        out = await gtools.dispatch("prometheus_query", {"query": "up"})
+        check("an instant query renders one line per series",
+              '2 series' in out and 'up{job="node"} 0' in out, out)
+        out = await gtools.dispatch("prometheus_query", {"query": "bad("})
+        check("a bad query reports Prometheus' error", "parse error" in out, out)
+        out = await gtools.dispatch("prometheus_query_range", {"query": "restarts", "minutes": 5})
+        check("a range query summarises and shows where it changed",
+              'pod="shared-pg-3"' in out and "max=8" in out and "=3" in out, out)
+        out = await gtools.dispatch("list_alerts", {})
+        check("alerts list shows state, silenced ones marked",
+              "KubePodCrashLooping [active]" in out and "(silenced)" in out, out)
+        out = await gtools.dispatch("list_silences", {})
+        check("silences list shows only live silences", "s1 [active]" in out and "s0" not in out, out)
+        gcfg.PROMETHEUS_URL = gcfg.ALERTMANAGER_URL = ""
+        check("unconfigured: the tools are not offered",
+              "prometheus_query" not in {t["function"]["name"] for t in gtools.offered()})
+    finally:
+        gcfg.PROMETHEUS_URL, gcfg.ALERTMANAGER_URL = saved
+
+    print("\n[proxy] encoding and client disconnects")
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.get(f"{PROXY}/", headers={"Accept-Encoding": "gzip"})
+    check("the web UI keeps its Content-Encoding and decodes to HTML",
+          r.headers.get("content-encoding") == "gzip" and r.content == UI_HTML,
+          (dict(r.headers), r.content[:60]))
+
+    import gateway.main as gmain
+    was_enabled = gcfg.TOOLS_ENABLED
+    gcfg.TOOLS_ENABLED = True
+    try:
+        gcfg.TOOLS_ENABLED = False
+        SEEN_AE.clear()
+        NEXT_QUEUE[:] = [{"content": "ok"}]
+        await stream_frames([{"role": "user", "content": "encoding check"}], AUTH)
+        check("captured (teed) chat requests ask upstream for identity",
+              SEEN_AE and all(a == "identity" for a in SEEN_AE), SEEN_AE)
+        gcfg.TOOLS_ENABLED = True
+
+        async def open_and_drop(headers):
+            slow = {"reasoning": "thinking " * 60, "delay": 0.05, "content": "late"}
+            NEXT_QUEUE[:] = [slow]
+            payload = {"model": "m", "stream": True,
+                       "messages": [{"role": "user", "content": "drop me"}]}
+            async with httpx.AsyncClient(timeout=30) as c:
+                async with c.stream("POST", f"{PROXY}/v1/chat/completions",
+                                    json=payload, headers=headers) as r:
+                    async for line in r.aiter_lines():
+                        if "reasoning_content" in line:
+                            break          # hang up mid-run
+            await asyncio.sleep(2.5)
+            return len(gmain._RUNS)
+
+        left = await open_and_drop(AUTH)
+        check("a chat client that hangs up cancels its run", left == 0, left)
+        left = await open_and_drop({**AUTH, "X-Run-Detached": "1"})
+        check("a detached run keeps going after the client hangs up", left == 1, left)
+        for _ in range(100):
+            if not gmain._RUNS:
+                break
+            await asyncio.sleep(0.1)
+    finally:
+        gcfg.TOOLS_ENABLED = was_enabled
+        NEXT_QUEUE.clear()
+
+
 async def main() -> int:
     up = uvicorn.Server(uvicorn.Config(fake, host="127.0.0.1", port=18000,
                                        log_level="error"))
@@ -1081,6 +1241,7 @@ async def main() -> int:
     try:
         await run_all()
         await run_git()
+        await run_observe_and_proxy()
     finally:
         up.should_exit = px.should_exit = True
         await asyncio.gather(t1, t2, return_exceptions=True)

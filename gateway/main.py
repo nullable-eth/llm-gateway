@@ -194,9 +194,10 @@ KEEPALIVE_S = 15
 # asyncio holds tasks weakly. A run whose client hung up is referenced by
 # nothing else and could be collected mid-loop; this keeps it alive to finish.
 _RUNS: set = set()
+_WATCHERS: set = set()
 
 
-def _live_stream(model: str, run, on_done):
+def _live_stream(model: str, run, on_done, detached: bool = False, request=None):
     """Stream a tool run as it happens.
 
     `run(emit)` is the loop; `emit` receives deltas which are relayed as SSE
@@ -204,10 +205,14 @@ def _live_stream(model: str, run, on_done):
     times it honestly. Tool execution produces no tokens, so SSE comments go
     out while it runs to keep proxies from calling the connection idle.
 
-    The loop runs in its own task: a client that hangs up does not cancel it,
-    so the archive still gets the whole run, exactly as before. Once the
-    response has started, an HTTP status can no longer change, so a failure is
-    reported in-band as a final content chunk.
+    The loop runs in its own task. When the client hangs up the run is
+    CANCELLED, unless the request asked to run detached (X-Run-Detached: 1):
+    a chat app that drops its connection when the screen locks otherwise left
+    a run burning the GPUs for up to the whole tool budget with nobody to read
+    the answer, and a retry started a second identical one (2026-09-17). The
+    cluster-agent asks for detached, so its runs survive an agent restart.
+    Once the response has started, an HTTP status can no longer change, so a
+    failure is reported in-band as a final content chunk.
     """
     queue: asyncio.Queue = asyncio.Queue()
     cid = "gw-" + store.now_iso()
@@ -220,12 +225,33 @@ def _live_stream(model: str, run, on_done):
             final, produced = await run(emit)
             on_done(final, produced)
             await queue.put(("done", final))
+        except asyncio.CancelledError:
+            # Ends the response generator too; otherwise it would wait on this
+            # queue forever, sending keepalives to a closed connection.
+            queue.put_nowait(("cancelled", None))
+            raise
         except Exception as e:                      # reported in-band below
             await queue.put(("error", e))
 
     task = asyncio.create_task(worker())
     _RUNS.add(task)
     task.add_done_callback(_RUNS.discard)
+
+    # The server does not reliably close the generator below when the client
+    # goes away, so watch for the disconnect directly.
+    async def watch():
+        while not task.done():
+            await asyncio.sleep(1)
+            if await request.is_disconnected():
+                if not task.done():
+                    log.info("client disconnected; cancelling its tool run")
+                    task.cancel()
+                return
+
+    if request is not None and not detached:
+        w = asyncio.create_task(watch())
+        _WATCHERS.add(w)
+        w.add_done_callback(_WATCHERS.discard)
 
     def frame(delta: dict, finish=None, extra=None) -> bytes:
         obj = {"id": cid, "object": "chat.completion.chunk", "model": model,
@@ -235,6 +261,17 @@ def _live_stream(model: str, run, on_done):
         return b"data: " + json.dumps(obj).encode() + b"\n\n"
 
     async def gen():
+        finished = False
+        try:
+            async for chunk in _frames():
+                yield chunk
+            finished = True
+        finally:
+            if not finished and not detached and not task.done():
+                log.info("client disconnected; cancelling its tool run")
+                task.cancel()
+
+    async def _frames():
         yield frame({"role": "assistant"})
         while True:
             try:
@@ -245,6 +282,8 @@ def _live_stream(model: str, run, on_done):
             if kind == "delta":
                 yield frame(val)
                 continue
+            if kind == "cancelled":
+                return
             if kind == "done":
                 ch = (val.get("choices") or [{}])[0]
                 extra = {k: val[k] for k in ("usage", "timings") if val.get(k)}
@@ -362,7 +401,10 @@ async def proxy(path: str, request: Request):
                 str(parsed.get("model") or "gateway"),
                 lambda emit: agentloop.run(client, config.UPSTREAM, loop_body,
                                            auth, compactor, emit=emit),
-                on_done)
+                on_done,
+                detached=(request.headers.get("x-run-detached") or "").strip().lower()
+                in ("1", "true", "yes"),
+                request=request)
         try:
             final, produced = await agentloop.run(
                 client, config.UPSTREAM, loop_body, auth,
@@ -394,7 +436,8 @@ async def proxy(path: str, request: Request):
 
     upstream = client.build_request(
         request.method, forward.url_for(path, request.url.query),
-        headers=forward.upstream_headers(request.headers), content=body)
+        headers=forward.upstream_headers(request.headers, pass_encoding=parsed is None),
+        content=body)
     try:
         resp = await client.send(upstream, stream=True)
     except httpx.HTTPError as e:
