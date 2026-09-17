@@ -106,43 +106,12 @@ STRIP_SAMPLING_FIELDS = tuple(f.strip() for f in os.environ.get(
 SAMPLING_KEEP_CLIENTS = {c.strip() for c in os.environ.get(
     "GATEWAY_SAMPLING_KEEP_CLIENTS", "agentmemory-filing").split(",") if c.strip()}
 
-# ----------------------------------------------------------------------- git
-# Read the operator's repos and propose changes as pull requests. Off unless a
-# token is present; the tools are not even offered without one. The token is a
-# fine-grained PAT limited to these repos (Contents + Pull requests, read and
-# write). gittools.py enforces the rest: allowlisted repos only, commits only to
-# GIT_BRANCH_PREFIX branches, and the only write is a PR.
-GIT_TOKEN = os.environ.get("GIT_TOKEN", "").strip()
-# Preferred over the env var: a Secret mounted as an OPTIONAL volume. The
-# kubelet fills it in whenever the Secret appears or rotates, so adding or
-# replacing the token needs no restart. Read on use, cached by mtime.
-GIT_TOKEN_FILE = os.environ.get("GIT_TOKEN_FILE", "/var/run/secrets/git/GIT_TOKEN")
-_git_token_cache = {"mtime": None, "value": ""}
-
-
-def git_token() -> str:
-    if GIT_TOKEN:
-        return GIT_TOKEN
-    try:
-        mtime = os.stat(GIT_TOKEN_FILE).st_mtime
-    except OSError:
-        return ""
-    if mtime != _git_token_cache["mtime"]:
-        with open(GIT_TOKEN_FILE) as f:
-            _git_token_cache.update(mtime=mtime, value=f.read().strip())
-    return _git_token_cache["value"]
-GIT_API = os.environ.get("GIT_API", "https://api.github.com").rstrip("/")
-GIT_OWNER = os.environ.get("GIT_OWNER", "nullable-eth")
-GIT_REPOS = [r.strip() for r in os.environ.get(
-    "GIT_REPOS", "Whitehorse,cluster-agent,agentmemory,llm-gateway").split(",") if r.strip()]
-GIT_BRANCH_PREFIX = os.environ.get("GIT_BRANCH_PREFIX", "agent/")
-
 # --------------------------------------------------------------------- tools
 # Always on where enabled, because the chat clients in play expose a fixed
 # api-key field and no way to send an extra header — per-request opt-in was
 # never reachable from them. Off for the fast/voice tier: an 8B model answering
 # "turn off the kitchen light" should not be paying for tool definitions, and
-# should not be holding kubectl.
+# should not be holding cluster tools.
 TOOLS_ENABLED = os.environ.get("GATEWAY_TOOLS", "0") not in ("0", "false", "no", "")
 # Raised from 8 after a real incident: eight steps was not enough to even
 # IDENTIFY a failing target, let alone fix it. The agent spent all eight on
@@ -172,34 +141,40 @@ UPSTREAM_MIN_TIMEOUT_S = int(os.environ.get("UPSTREAM_MIN_TIMEOUT_S", "30"))
 # leaves 2 minutes of headroom.
 ANSWER_TIMEOUT_S = int(os.environ.get("ANSWER_TIMEOUT_S", "240"))
 TOOL_OUTPUT_MAX = int(os.environ.get("TOOL_OUTPUT_MAX", "8000"))
-KUBECTL_TIMEOUT_S = int(os.environ.get("KUBECTL_TIMEOUT_S", "60"))
 # Guidance injected with the tools. The client never asked for the tools and
 # cannot know how to budget them, so the policy travels with them. Empty
 # disables. Default lives in policy.py.
 TOOL_SYSTEM_PROMPT = os.environ.get("TOOL_SYSTEM_PROMPT", "__default__")
 
-# propose | auto. Mutations are recorded rather than executed unless auto, and
-# auto alone still does nothing without the phase-2 RBAC.
-MODE = os.environ.get("MODE", "propose")
-# Components the agent may not act on — the rule that stops it restarting the
-# model it is thinking with.
-PROTECTED = {p.strip() for p in os.environ.get("PROTECTED", "").split(",") if p.strip()}
+# ----------------------------------------------------------------------- mcp
+# The ONE tool endpoint: an MCP server, normally an MCP gateway multiplexing
+# many. Empty means the loop has nothing to offer but finish(). What the tools
+# may do is enforced behind it, never here.
+MCP_URL = os.environ.get("MCP_URL", "").strip()
+# Bearer token for that endpoint. Prefer the file: mounted from an optional
+# Secret it can appear or rotate without a restart. Read on use, cached by mtime.
+MCP_TOKEN = os.environ.get("MCP_TOKEN", "").strip()
+MCP_TOKEN_FILE = os.environ.get("MCP_TOKEN_FILE", "/var/run/secrets/mcp/token")
+_mcp_token_cache = {"mtime": None, "value": ""}
 
-HA_URL = os.environ.get("HA_URL", "").rstrip("/")
-HA_TOKEN = os.environ.get("HA_TOKEN", "")
-MEMORY_URL = os.environ.get("MEMORY_URL", "").rstrip("/")
-MEMORY_TOKEN = os.environ.get("MEMORY_TOKEN", "")
-# How many hits a memory search returns. Was effectively 6-8, which measured out
-# as "the operator said it, at rank 12, and nobody looked past 8". Hits render
-# one line each now, so a large k costs little and buys the tail of the ranking,
-# which is where a decision from months ago actually sits.
-MEMORY_SEARCH_K = int(os.environ.get("MEMORY_SEARCH_K", "25"))
-MEMORY_SEARCH_MAX_K = int(os.environ.get("MEMORY_SEARCH_MAX_K", "50"))
-# Alertmanager's own API, for silencing an alert the operator has already said
-# to ignore. Empty disables the tool. The cap is what keeps a silence from
-# outliving its reason: 30 days, and the default is a week.
-ALERTMANAGER_URL = os.environ.get("ALERTMANAGER_URL", "").rstrip("/")
-# Prometheus's HTTP API, for the read-only query tools (observe.py). Empty
-# disables them.
-PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "").rstrip("/")
-SILENCE_MAX_HOURS = int(os.environ.get("SILENCE_MAX_HOURS", "720"))
+
+def mcp_token() -> str:
+    if MCP_TOKEN:
+        return MCP_TOKEN
+    try:
+        mtime = os.stat(MCP_TOKEN_FILE).st_mtime
+    except OSError:
+        return ""
+    if mtime != _mcp_token_cache["mtime"]:
+        with open(MCP_TOKEN_FILE) as f:
+            _mcp_token_cache.update(mtime=mtime, value=f.read().strip())
+    return _mcp_token_cache["value"]
+
+
+# One tool call's limit. Exec'd commands and log queries can be slow; the
+# loop's own deadlines still bound the whole run.
+MCP_CALL_TIMEOUT_S = float(os.environ.get("MCP_CALL_TIMEOUT_S", "120"))
+# How long a tools/list is reused. New or removed tools appear within this.
+MCP_TOOLS_TTL_S = float(os.environ.get("MCP_TOOLS_TTL_S", "60"))
+# The endpoint's own instructions are appended to the tool policy, capped.
+MCP_INSTRUCTIONS_MAX = int(os.environ.get("MCP_INSTRUCTIONS_MAX", "4000"))

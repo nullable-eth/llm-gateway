@@ -3,63 +3,67 @@
 The client does not know these tools exist. Jan sends a chat request; the
 gateway quietly attaches tools it never asked for. Handing a model tools
 with no instruction on how to spend them is how you get what we measured
-against the live archive: thirteen `search_memory` calls in one run, each a
-slight rewording of the last, because a 500-char snippet was not enough and
-nothing said what to do about it.
+against the live archive: thirteen memory searches in one run, each a slight
+rewording of the last, because a snippet was not enough and nothing said what
+to do about it.
 
-So the tools and the policy for using them travel together — injecting one
-without the other is an incomplete feature, not a leaner one.
+So the tools and the policy for using them travel together. The policy is
+generic — it names no tool, because the tool set is whatever the MCP endpoint
+offers — and is followed by that endpoint's own instructions, if it sent any.
+Deployment-specific guidance (what this cluster is, what to fix and how)
+belongs in the caller's own prompt.
 
 It is appended to the caller's own system message rather than replacing it, so
 whatever persona or instructions the client set still lead. Set
 TOOL_SYSTEM_PROMPT="" to disable.
 """
-from . import config
+from . import config, tools
 
 DEFAULT = """\
-You have tools for this cluster and the operator's long-term archive. Spend \
-them deliberately — the budget is small and each call is slow.
+You have tools. Spend them deliberately — the budget is limited and each call \
+is slow.
 
-- search_memory returns scored snippets, each with a message_uuid. If a \
-snippet looks relevant but is too short, call get_context on that \
-message_uuid. Do NOT search again with reworded terms: a second phrasing \
-rarely surfaces anything the first missed, and it costs a step you will want.
-- Never repeat a search or a kubectl command you have already run in this \
-conversation. You already have the answer; re-read it.
-- run_kubectl can change the cluster, not only read it. Ask for exactly what \
-you need (-n <namespace>, a specific resource) rather than listing everything.
-- You may act to restore service: delete, patch, scale, cordon, drain, \
-annotate, force a reconcile. Every action you take is shown to the operator \
-as it happens, including the ones that get refused, so act where it helps and \
-expect to be seen doing it.
-- Flux owns desired state and reverts direct writes within 30 minutes. So a \
-write is a way to restore service NOW; anything meant to STICK is a git change.
-- When git tools are present, make that change yourself as a pull request: \
-find the file (git_list_files / git_search in Whitehorse, the cluster's GitOps \
-repo), git_read_file it, then git_open_pr with small exact edits and a body \
-giving the evidence and how to verify. The operator reviews and merges it; \
-never claim a PR is applied until it is merged. Keep PRs focused, one change \
-each, and give the PR link in your answer.
-- silence_alert only when the operator has already said this state is known. \
-Their words, cited, or not at all — never your own judgement that something \
-looks unimportant.
+- What you may do is decided by the permissions behind each tool, not by \
+these instructions. If a call is refused, the refusal is the answer: do not \
+try another tool or route to the same action. If your access turns out to be \
+read-only, say what you would change and why.
+- You may act to restore service when you have a probable cause and a known \
+repair. Every call that can change something is shown to the operator as it \
+happens, including refused ones. If an action fails, read why before trying \
+the next step.
+- Ask for exactly what you need: a namespace, a name, a label, a limit, a \
+time range. Large listings are truncated.
+- Never repeat a call you have already made in this conversation. You already \
+have the answer; re-read it.
+- When a search hit is too short, read the context around it rather than \
+searching again with reworded terms.
+- Where desired state lives in a repository, a direct change restores service \
+now but may be reverted; a change meant to stick is a pull request, which a \
+human merges. Never claim a pull request is applied until it is merged.
 - Answer as soon as you can support the answer. Say plainly what you could \
-not determine rather than searching for it again.
+not determine.
 """
+
+
+def text() -> str:
+    base = DEFAULT if config.TOOL_SYSTEM_PROMPT == "__default__" else config.TOOL_SYSTEM_PROMPT
+    if not base:
+        return ""
+    extra = tools.instructions().strip()
+    return base + ("\n\nTool server notes:\n" + extra if extra else "")
 
 
 def apply(messages: list) -> list:
     """Append the policy to the caller's system message, or add one."""
-    text = DEFAULT if config.TOOL_SYSTEM_PROMPT == "__default__" \
-        else config.TOOL_SYSTEM_PROMPT
-    if not text:
+    body = text()
+    if not body:
         return messages
     out = list(messages)
     for i, m in enumerate(out):
         if m.get("role") == "system":
             merged = dict(m)
             merged["content"] = ((m.get("content") or "").rstrip()
-                                 + "\n\n" + text)
+                                 + "\n\n" + body)
             out[i] = merged
             return out
-    return [{"role": "system", "content": text}] + out
+    return [{"role": "system", "content": body}] + out

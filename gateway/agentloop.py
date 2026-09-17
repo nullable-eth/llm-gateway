@@ -3,7 +3,7 @@
 The client sends one request and gets one reply. Everything between — the
 tool calls, their output, the model's second and third thoughts — happens
 here and is invisible to the caller, which is what lets a chat client with no
-tool support ask questions that need kubectl.
+tool support ask questions that need tools.
 
 It is invisible to the caller but NOT to the archive: the loop hands capture
 the whole message list it built, so the transcript holds every tool call and
@@ -36,10 +36,7 @@ class UpstreamError(Exception):
 def _describe(name: str, args: dict) -> str:
     """One line for the live thinking stream, so a watching client sees what
     the loop is doing instead of a silent pause."""
-    if name == "run_kubectl" and isinstance(args.get("args"), list):
-        detail = "kubectl " + " ".join(str(a) for a in args["args"])
-    else:
-        detail = json.dumps(args, ensure_ascii=False)
+    detail = json.dumps(args, ensure_ascii=False)
     if len(detail) > 300:
         detail = detail[:300] + "…"
     return f"\n\n[tool] {name}: {detail}\n\n"
@@ -194,7 +191,7 @@ async def run(client, upstream: str, body: dict, auth: str, compactor,
         call_body["messages"] = messages
         call_body["stream"] = False
         if offer_tools:
-            call_body["tools"] = tools.offered()
+            call_body["tools"] = await tools.offered()
         else:
             call_body.pop("tools", None)
             messages = messages + [{"role": "user", "content":

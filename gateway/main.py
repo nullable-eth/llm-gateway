@@ -387,6 +387,7 @@ async def proxy(path: str, request: Request):
     if parsed is not None and config.TOOLS_ENABLED:
         auth = request.headers.get("authorization") or ""
         loop_body = dict(new_body or fwd)
+        await tools.offered()      # connects and caches; the policy carries its instructions
         loop_body["messages"] = policy.apply(loop_body.get("messages") or [])
         sent = list(loop_body["messages"])
         wants_stream = bool(parsed.get("stream"))

@@ -6,8 +6,8 @@ client they use:
 
 - **logging** — every conversation archived as markdown into an agentmemory vault
 - **compaction** — conversations that would overflow the context are summarised
-- **tools** — the gateway runs the tool loop, so clients with no tool support
-  can still ask questions that need `kubectl` or the memory archive
+- **tools** — the gateway runs the tool loop against one MCP endpoint, so
+  clients with no tool support can still use every tool behind it
 
 Point your Service at the gateway and let it forward to the model. Clients need
 no changes at all.
@@ -45,18 +45,27 @@ complete and the reply records `context_compacted`. Token counts are exact,
 from the server's own `/apply-template` and `/tokenize`.
 
 **tools** runs the loop: call the model, execute what it asks for, repeat,
-return one finished answer. `search_memory` returns scored snippets each
-carrying a `message_uuid`, and `get_context` reads the archived conversation
-around one — without that second tool a model that finds a snippet too short
-can only search again with different words, which it will do until it runs out
-of steps.
+return one finished answer. The tools are whatever **one MCP endpoint**
+(`MCP_URL`, Streamable HTTP) lists — normally an MCP gateway such as
+[agentgateway](https://agentgateway.dev) multiplexing many servers. The gateway
+has no tools of its own besides `finish()`, holds no tool credentials, and
+keeps no permission list: what a call may do is decided behind the endpoint
+(each server's credentials, Kubernetes RBAC and admission policy, the MCP
+gateway's authorization rules), and a refusal comes back to the model as the
+tool's result. Read-only access is a read-only role, not a mode here.
+
+Every call is streamed to the caller as a `tool_event` delta (`call` with name,
+args and `mutating`; `result` with summary, output and `error`), and every call
+that may change something is logged. `mutating` comes from the tool's MCP
+annotations: anything not marked `readOnlyHint` is reported as an action.
 
 The tools arrive with a **use policy** appended to the caller's system message
 (`gateway/policy.py`). The client never asked for these tools and cannot know
 how to budget them, so injecting the tools without the guidance is an
-incomplete feature: measured against the live archive, a model given
-search_memory and no policy ran it thirteen times in one request, each a
-reword of the last. `TOOL_SYSTEM_PROMPT=""` disables it. The client sees a single reply; the archive gets
+incomplete feature: measured against the live archive, a model given a memory
+search and no policy ran it thirteen times in one request, each a reword of
+the last. The policy names no tool; the endpoint's own `instructions` are
+appended to it. `TOOL_SYSTEM_PROMPT=""` disables it. The client sees a single reply; the archive gets
 every tool call, result and intermediate thought. Compaction runs *between*
 steps too, because tool output is what actually overflows a window.
 
@@ -67,24 +76,10 @@ The gateway holds no API key and should not be given one. Its own calls —
 **caller's** `Authorization` header, so they are made on behalf of someone
 already entitled to use the model. No header, no compaction and no loop.
 
-**With tools enabled this is a privilege escalation and should be understood as
-one.** Anything holding the inference key can reach `kubectl` through the
-gateway, where that key previously bought only inference. The guards bound what
-it can do, not who may try:
-
-- read verbs pass; `DENY` refuses secrets, exec, attach, cp, port-forward and
-  every direct-write verb, because writes belong to GitOps
-- anything matching a `PROTECTED` component is refused for non-read verbs —
-  the rule that stops the agent restarting the model it is thinking with
-- mutations require `MODE=auto`, and are otherwise recorded as proposals
-- the RBAC underneath is read-only and enumerates resources, so `secrets` is
-  structurally absent rather than merely denied
-
-The intended next step is a **separate tool credential** so a leaked inference
-key cannot reach the cluster at all. The blocker is client-side: chat clients
-in practice expose a fixed api-key field and no way to send an extra header, so
-that credential has to ride a distinct port or model name rather than a header.
-Until then, treat the inference key as cluster-read-capable.
+**With tools enabled, the inference key reaches the tools.** Anything that may
+call the model through this gateway may use everything `MCP_URL` offers, so
+scope what the endpoint's credentials can do to what any holder of the
+inference key may do, and restrict who can reach the model port.
 
 ## Configuration
 
@@ -102,16 +97,16 @@ Until then, treat the inference key as cluster-read-capable.
 | `COMPACT_N_CTX` | `0` | Override the probed window — **set this when the server runs more than one slot**, since what matters is `n_ctx / n_parallel` |
 | `GATEWAY_STRIP_SAMPLING` | `0` | Drop client sampling fields (`temperature`, `top_p`, `top_k`, `min_p`, penalties, …) so the model server's `--temp`/`--top-p`/… flags always apply. The archive still records what the client sent |
 | `GATEWAY_SAMPLING_KEEP_CLIENTS` | `agentmemory-filing` | `X-Capture-Client` names whose sampling is deliberate and kept |
-| `GIT_TOKEN_FILE` / `GIT_TOKEN` | `/var/run/secrets/git/GIT_TOKEN` / *(empty)* | Fine-grained GitHub PAT (Contents + Pull requests RW on the allowed repos). Without one the git tools are not offered. The file is re-read on change, so mounting it from an optional Secret needs no restart |
-| `GIT_OWNER` / `GIT_REPOS` | `nullable-eth` / `Whitehorse,cluster-agent,agentmemory,llm-gateway` | The only repos the git tools touch |
-| `GIT_BRANCH_PREFIX` | `agent/` | The only branches the agent commits to; its only write is a PR (`git_open_pr`). SOPS files and CI workflows are refused, YAML must still parse |
-| `MODE` | `propose` | `propose` or `auto`; auto alone still needs phase-2 RBAC |
-| `PROTECTED` | *(empty)* | Components the agent may not act on |
-| `TOOL_MAX_STEPS` | `8` | Model+tool round trips before it must answer |
-| `TOOL_MAX_SECONDS` | `180` | Wall-clock budget for starting new tool work; past it the tools are withdrawn |
+| `MCP_URL` | *(empty)* | The tool endpoint (MCP Streamable HTTP). Empty: no tools but `finish()` |
+| `MCP_TOKEN_FILE` / `MCP_TOKEN` | `/var/run/secrets/mcp/token` / *(empty)* | Bearer token for the endpoint, if it wants one. The file is re-read on change |
+| `MCP_CALL_TIMEOUT_S` | `120` | One tool call's limit |
+| `MCP_TOOLS_TTL_S` | `60` | How long a `tools/list` is reused |
+| `MCP_INSTRUCTIONS_MAX` | `4000` | Cap on the endpoint instructions appended to the policy |
+| `TOOL_MAX_STEPS` | `40` | Model+tool round trips before it must answer |
+| `TOOL_MAX_SECONDS` | `1200` | Wall-clock budget for starting new tool work; past it the tools are withdrawn |
+| `REQUEST_MAX_SECONDS` | `1440` | Ceiling on the whole request, loop included |
+| `TOOL_OUTPUT_MAX` | `8000` | Characters of one tool result the model sees |
 | `TOOL_SYSTEM_PROMPT` | *(built-in)* | Tool-use policy appended to the caller's system message; empty disables |
-| `HA_URL` / `HA_TOKEN` | *(empty)* | Home Assistant; empty disables those tools |
-| `MEMORY_URL` / `MEMORY_TOKEN` | *(empty)* | agentmemory search; empty disables that tool |
 
 Full list in `gateway/config.py`, which is the only place env is read.
 
@@ -151,8 +146,8 @@ python tests/test_gateway.py
 
 Runs a fake model server and the real gateway against a scratch vault and
 asserts on the rendered markdown, on what the chunker makes of it, on the
-compaction decisions, and on the tool guards. `run_kubectl` is stubbed — a test
-that shells out to a real cluster is not a test.
+compaction decisions, and on the tool loop against a fake MCP endpoint
+(`tests/fake_mcp.py`) — a test that calls a real cluster is not a test.
 
 ## Release
 
