@@ -199,4 +199,7 @@ MEMORY_SEARCH_MAX_K = int(os.environ.get("MEMORY_SEARCH_MAX_K", "50"))
 # to ignore. Empty disables the tool. The cap is what keeps a silence from
 # outliving its reason: 30 days, and the default is a week.
 ALERTMANAGER_URL = os.environ.get("ALERTMANAGER_URL", "").rstrip("/")
+# Prometheus's HTTP API, for the read-only query tools (observe.py). Empty
+# disables them.
+PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "").rstrip("/")
 SILENCE_MAX_HOURS = int(os.environ.get("SILENCE_MAX_HOURS", "720"))
