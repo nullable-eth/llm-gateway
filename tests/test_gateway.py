@@ -28,7 +28,8 @@ os.environ.update(
     CAPTURE_MAX_OPEN_S="999999",
     COMPACT_RESERVE="100",
     COMPACT_KEEP_TAIL="4",
-    PROTECTED="llm-expert,cluster-agent",
+    MCP_URL="http://127.0.0.1:18000/mcp",
+    MCP_TOKEN="mcptest",
 )
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
@@ -165,128 +166,10 @@ async def _record_ae(request: Request, call_next):
     return await call_next(request)
 
 
-# --- a fake Prometheus and Alertmanager (read-only tools) --------------------
-@fake.get("/prom/api/v1/query")
-async def prom_query(query: str):
-    if query == "bad(":
-        return JSONResponse({"status": "error", "errorType": "bad_data", "error": "parse error"}, 400)
-    return {"status": "success", "data": {"resultType": "vector", "result": [
-        {"metric": {"__name__": "up", "job": "kube-state-metrics"}, "value": [1, "1"]},
-        {"metric": {"__name__": "up", "job": "node"}, "value": [1, "0"]}]}}
+# --- a fake MCP endpoint: the gateway's only source of tools -------------
+import fake_mcp                                                 # noqa: E402
 
-
-@fake.get("/prom/api/v1/query_range")
-async def prom_range(query: str, start: float, end: float, step: str):
-    t = int(start)
-    return {"status": "success", "data": {"resultType": "matrix", "result": [
-        {"metric": {"pod": "shared-pg-3"},
-         "values": [[t, "0"], [t + 60, "0"], [t + 120, "3"], [t + 180, "8"]]}]}}
-
-
-@fake.get("/am/api/v2/alerts")
-async def am_alerts():
-    return [{"labels": {"alertname": "KubePodCrashLooping", "namespace": "databases"},
-             "annotations": {"summary": "Pod is crash looping."},
-             "startsAt": "2026-09-16T21:51:00Z",
-             "status": {"state": "active", "silencedBy": [], "inhibitedBy": []}},
-            {"labels": {"alertname": "NodeBondingDegraded"}, "annotations": {},
-             "startsAt": "2026-09-16T19:00:00Z",
-             "status": {"state": "suppressed", "silencedBy": ["s1"], "inhibitedBy": []}}]
-
-
-@fake.get("/am/api/v2/silences")
-async def am_silences():
-    return [{"id": "s1", "status": {"state": "active"}, "endsAt": "2026-09-23T19:53:07Z",
-             "createdBy": "cluster-agent", "comment": "operator said ignore",
-             "matchers": [{"name": "alertname", "value": "NodeBondingDegraded"}]},
-            {"id": "s0", "status": {"state": "expired"}, "matchers": []}]
-
-
-# --- a fake GitHub, just the REST calls gittools makes ---------------------
-import hashlib as _hl
-
-GH = {"branches": {}, "commits": {}, "trees": {}, "pulls": [], "calls": []}
-
-
-def _gh_sha(obj) -> str:
-    return _hl.sha1(json.dumps(obj, sort_keys=True).encode()).hexdigest()
-
-
-def gh_reset():
-    files = {"kubernetes/apps/media/sonarr/helmrelease.yaml":
-             "spec:\n  values:\n    resources: { requests: { memory: 512Mi } }\n",
-             "README.md": "hello\n"}
-    t = _gh_sha(files)
-    c = _gh_sha({"tree": t, "parents": []})
-    GH.update(branches={"main": c}, commits={c: {"tree": t, "parents": []}},
-              trees={t: files}, pulls=[], calls=[])
-
-
-@fake.api_route("/gh/{rest:path}", methods=["GET", "POST", "PATCH"])
-async def github(rest: str, request: Request):
-    import base64 as _b64
-    GH["calls"].append((request.method, rest))
-    if request.headers.get("authorization") != "Bearer ghtest":
-        return JSONResponse({"message": "Bad credentials"}, status_code=401)
-    body = await request.json() if request.method != "GET" else {}
-    q = request.query_params
-    if rest == "search/code":
-        return {"items": [{"path": p} for p in GH["trees"][GH["commits"][GH["branches"]["main"]]["tree"]]
-                          if q["q"].split()[0] in GH["trees"][GH["commits"][GH["branches"]["main"]]["tree"]][p]]}
-    parts = rest.split("/")
-    if parts[0] != "repos" or "/".join(parts[1:3]) != "nullable-eth/Whitehorse":
-        return JSONResponse({"message": "Not Found"}, status_code=404)
-    tail = "/".join(parts[3:])
-    def files_at(ref):
-        sha = GH["branches"].get(ref, ref)
-        return GH["trees"][GH["commits"][sha]["tree"]] if sha in GH["commits"] else None
-    if tail == "":
-        return {"default_branch": "main"}
-    if tail.startswith("git/ref/heads/"):
-        b = tail[len("git/ref/heads/"):]
-        if b not in GH["branches"]:
-            return JSONResponse({"message": "Not Found"}, status_code=404)
-        return {"object": {"sha": GH["branches"][b]}}
-    if tail.startswith("contents/"):
-        f = files_at(q.get("ref", "main")) or {}
-        path = tail[len("contents/"):]
-        if path not in f:
-            return JSONResponse({"message": "Not Found"}, status_code=404)
-        return {"encoding": "base64", "content": _b64.b64encode(f[path].encode()).decode()}
-    if tail.startswith("git/trees/") and request.method == "GET":
-        f = files_at(tail[len("git/trees/"):])
-        return {"tree": [{"path": p, "type": "blob"} for p in sorted(f)]}
-    if tail.startswith("git/commits/") and request.method == "GET":
-        return {"tree": {"sha": GH["commits"][tail[len("git/commits/"):]]["tree"]}}
-    if tail == "git/trees":
-        files = dict(GH["trees"][body["base_tree"]])
-        for e in body["tree"]:
-            if e.get("sha", "x") is None:
-                files.pop(e["path"], None)
-            else:
-                files[e["path"]] = e["content"]
-        t = _gh_sha(files); GH["trees"][t] = files
-        return {"sha": t}
-    if tail == "git/commits":
-        c = _gh_sha(body); GH["commits"][c] = {"tree": body["tree"], "parents": body["parents"],
-                                               "message": body["message"]}
-        return {"sha": c}
-    if tail == "git/refs":
-        GH["branches"][body["ref"][len("refs/heads/"):]] = body["sha"]
-        return {"ref": body["ref"]}
-    if tail.startswith("git/refs/heads/") and request.method == "PATCH":
-        GH["branches"][tail[len("git/refs/heads/"):]] = body["sha"]
-        return {}
-    if tail == "pulls" and request.method == "POST":
-        pr = {"number": len(GH["pulls"]) + 1, "title": body["title"], "body": body["body"],
-              "base": body["base"], "head": {"ref": body["head"]},
-              "html_url": f"https://github.test/pr/{len(GH['pulls']) + 1}"}
-        GH["pulls"].append(pr)
-        return pr
-    if tail == "pulls":
-        head = q.get("head", "")
-        return [p for p in GH["pulls"] if not head or head.endswith(":" + p["head"]["ref"])]
-    return JSONResponse({"message": f"fake has no {tail}"}, status_code=404)
+fake.add_api_route("/mcp", fake_mcp.endpoint, methods=["POST"])
 
 
 # ----------------------------------------------------------------- helpers
@@ -743,75 +626,31 @@ async def run_all():
     # --------------------------------------------------------------- [11]
     print("\n[11] tool loop")
     import gateway.tools as gtools
-    check("guard allows a plain read",
-          gtools.kubectl_guard(["get", "pods", "-n", "ai"]) is None)
-    check("guard refuses secrets outright",
-          gtools.kubectl_guard(["get", "secrets"]) is not None)
-    check("guard refuses exec",
-          gtools.kubectl_guard(["exec", "-it", "pod"]) is not None)
-    # The 2026-09-17 bypass: flags before the verb hid it from the guard.
-    for argv in (["-n", "media", "exec", "deploy/x", "--", "sh"],
-                 ["--namespace=media", "exec", "deploy/x"],
-                 ["--context", "c", "-n", "ai", "attach", "p"],
-                 ["-n", "x", "debug", "node/n"],
-                 ["alpha", "debug", "p"],
-                 ["--kubeconfig=/tmp/k", "get", "pods"],
-                 ["--some-flag", "get", "pods"],
-                 ["-n", "media"]):
-        check(f"guard refuses {' '.join(argv)}", gtools.kubectl_guard(argv) is not None,
-              str(gtools.kubectl_guard(argv)))
-    check("guard allows a namespace flag before a read",
-          gtools.kubectl_guard(["-n", "media", "get", "pods"]) is None,
-          str(gtools.kubectl_guard(["-n", "media", "get", "pods"])))
-    check("secrets are refused even behind a namespace flag",
-          gtools.kubectl_guard(["-n", "media", "get", "secrets"]) is not None)
-    check("a write behind a namespace flag counts as a mutation",
-          gtools.is_mutation("run_kubectl", {"args": ["-n", "media", "delete", "pod", "p"]}))
-    check("a read behind a namespace flag is not a mutation",
-          not gtools.is_mutation("run_kubectl", {"args": ["-n", "media", "get", "pods"]}))
-    check("guard refuses acting on a protected component",
-          gtools.kubectl_guard(["rollout", "restart", "deploy/llm-expert"]) is not None)
-    check("guard refuses mutations in propose mode",
-          gtools.kubectl_guard(["delete", "pod", "something"]) is not None)
+    import gateway.mcpclient as gmcp
+    from gateway import policy
+    offered = await gtools.offered()
+    names = [t["function"]["name"] for t in offered]
+    check("every MCP tool is offered, across list pages, plus finish",
+          names == [t["name"] for t in fake_mcp.TOOLS] + ["finish"], names)
+    pods = next(t for t in offered if t["function"]["name"] == "kubernetes_pods_list")
+    check("an MCP input schema becomes the function parameters",
+          pods["function"]["parameters"].get("properties", {}).get("namespace")
+          and "$schema" not in pods["function"]["parameters"], str(pods))
+    so = next(t for t in offered if t["function"]["name"] == "structured_only")
+    check("a tool without a schema still gets an object schema",
+          so["function"]["parameters"] == {"type": "object", "properties": {}}, str(so))
+    check("the endpoint was called with its token", fake_mcp.STATE["bad_auth"] == 0)
+    check("the endpoint's own instructions travel with the policy",
+          "FAKE MCP NOTES" in policy.text(), policy.text()[-200:])
 
-    # The action surface is now "anything kubectl can do" minus four structural
-    # refusals. These check the refusals are the ones intended and that ordinary
-    # repair verbs are not among them.
-    check("guard refuses a shell into a workload",
-          gtools.kubectl_guard(["port-forward", "svc/x", "8080"]) is not None)
-    check("guard refuses impersonation",
-          gtools.kubectl_guard(["get", "pods", "--as=system:admin"]) is not None)
-    check("guard refuses touching service accounts",
-          gtools.kubectl_guard(["delete", "serviceaccount", "x"]) is not None)
-    check("guard refuses RBAC edits",
-          gtools.kubectl_guard(["patch", "clusterrolebinding", "x"]) is not None)
-    check("guard refuses a secret by slash spelling",
-          gtools.kubectl_guard(["get", "secret/db-creds"]) is not None)
-    real_mode2, gcfg.MODE = gcfg.MODE, "auto"
-    try:
-        for argv, label in ((["patch", "deployment", "x", "-p", "{}"], "patch"),
-                            (["cordon", "whitehorse-media"], "cordon"),
-                            (["drain", "whitehorse-media", "--ignore-daemonsets"], "drain"),
-                            (["scale", "deploy/x", "--replicas=0"], "scale"),
-                            (["delete", "volumeattachment", "csi-abc"], "delete volumeattachment")):
-            check(f"auto mode allows {label}", gtools.kubectl_guard(argv) is None,
-                  str(gtools.kubectl_guard(argv)))
-        check("but still not into the brain it is thinking with",
-              gtools.kubectl_guard(["scale", "deploy/llm-expert", "--replicas=0"]) is not None)
-    finally:
-        gcfg.MODE = real_mode2
-
-    names = {t["function"]["name"] for t in gtools.TOOLS}
-    check("memory search and context are both offered, not just search",
-          {"search_memory", "get_context"} <= names, str(sorted(names)))
-
-    # silence_alert: the mutation that lets a known-accepted alert stop costing
-    # attention. Every guard here is load-bearing — a silence that is too broad,
-    # unexplained, or longer than its reason is worse than the alert.
-    check("silencing is offered", "silence_alert" in names, str(sorted(names)))
+    check("a tool annotated read-only is not an action",
+          not gtools.is_mutation("kubernetes_pods_list", {}))
+    check("a destructive tool is an action", gtools.is_mutation("kubernetes_pods_delete", {}))
+    check("an unannotated tool is reported as an action, not exempt",
+          gtools.is_mutation("github_push_files", {}))
 
     # An empty finish() is not an answer. A phone client asked a question, the
-    # model ran kubectl, then ended its turn with nothing in the report and the
+    # model ran a tool, then ended its turn with nothing in the report and the
     # caller got the literal string "(no summary given)".
     import gateway.agentloop as gloop
     check("a finish with a summary renders it",
@@ -820,98 +659,82 @@ async def run_all():
           gloop._render_finish({}) == gloop.NOTHING_SAID, gloop._render_finish({}))
     check("and so is one with only blank fields",
           gloop._render_finish({"summary": "   ", "actions_taken": []}) == gloop.NOTHING_SAID)
-    real_am, gcfg.ALERTMANAGER_URL = gcfg.ALERTMANAGER_URL, "http://am.test:9093"
-    real_mode = gcfg.MODE
-    try:
-        check("a silence without an alertname is refused as too broad",
-              (await gtools.silence_alert("", "operator said ignore it, cable moved"))
-              .startswith("REFUSED"))
-        check("a silence with no real reason is refused",
-              (await gtools.silence_alert("NodeBondingDegraded", "known"))
-              .startswith("REFUSED"))
-        gcfg.MODE = "propose"
-        out = await gtools.silence_alert("NodeBondingDegraded",
-                                         "operator moved the cable; restoring when new "
-                                         "cable is run", 168, {"instance": "192.168.1.12"})
-        check("in propose mode it is recorded, not sent", out.startswith("PROPOSAL RECORDED"))
-        check("and the proposal keeps the extra matcher, so the silence stays narrow",
-              "192.168.1.12" in out, out)
-        gcfg.SILENCE_MAX_HOURS = 720
-        out = await gtools.silence_alert("X", "operator said to ignore this one", 99999)
-        check("duration is capped rather than honoured", "720h" in out, out)
-    finally:
-        gcfg.ALERTMANAGER_URL, gcfg.MODE = real_am, real_mode
-    check("search's description points at get_context rather than re-searching",
-          "get_context" in [t["function"]["description"]
-                            for t in gtools.TOOLS
-                            if t["function"]["name"] == "search_memory"][0])
-    check("an unknown tool is refused, not crashed on",
-          (await gtools.dispatch("nope", {})).startswith("REFUSED"))
 
-    # Nothing changes without the channel hearing about it. This is the
-    # condition the agent is allowed to act under, so it is tested, not trusted.
-    check("a read is not an action", not gtools.is_mutation("run_kubectl", {"args": ["get", "pods"]}))
-    check("memory search is not an action", not gtools.is_mutation("search_memory", {"query": "x"}))
-    check("deleting a pod is an action", gtools.is_mutation("run_kubectl", {"args": ["delete", "pod", "p"]}))
-    check("a rollout restart is an action",
-          gtools.is_mutation("run_kubectl", {"args": ["rollout", "restart", "deploy/x"]}))
-    check("silencing is an action", gtools.is_mutation("silence_alert", {}))
-
-    # Every tool call is reported on the stream as a structured event, before
-    # and after, marked when it changes something. The caller decides where to
-    # show it; the gateway knows nothing about Discord.
+    # The gateway holds no credentials and no permission list: every tool
+    # comes from the endpoint, every refusal from behind it.
     check("the gateway has no Discord settings",
           not any(k.startswith("DISCORD") for k in vars(gcfg)))
-    check("and no announcer", not hasattr(gtools, "announce") and not hasattr(gtools, "ANNOUNCE_TO"))
+    check("nor any built-in tool, guard or permission setting",
+          not any(hasattr(gtools, n) for n in ("run_kubectl", "kubectl_guard", "silence_alert", "TOOLS"))
+          and not any(hasattr(gcfg, n) for n in ("MODE", "PROTECTED", "GIT_TOKEN", "HA_TOKEN")))
+
     said: list[dict] = []
     async def _emit(d): said.append(d["tool_event"])
-    await gtools.dispatch("run_kubectl", {"args": ["get", "pods", "-n", "ai"]}, _emit)
+    out = await gtools.dispatch("kubernetes_pods_list", {"namespace": "ai"}, _emit)
     check("a read is reported as a non-mutating call and result",
           [(e["phase"], e["mutating"]) for e in said] == [("call", False), ("result", False)], str(said))
+    check("an SSE-framed result is read past its notifications",
+          out.startswith("FAKE pods in ai"), out)
     said.clear()
-    await gtools.dispatch("run_kubectl", {"args": ["delete", "pod", "nope-does-not-exist"]}, _emit)
+    out = await gtools.dispatch("kubernetes_pods_delete", {"name": "x", "namespace": "ai"}, _emit)
     check("a mutation is reported before and after, marked mutating",
           [(e["phase"], e["mutating"]) for e in said] == [("call", True), ("result", True)], str(said))
-    check("the attempt carries its arguments even when it is refused",
-          said and said[0]["args"] == {"args": ["delete", "pod", "nope-does-not-exist"]}, str(said))
-    check("and the outcome carries a summary", said and said[-1].get("summary"), str(said))
+    check("the attempt carries its arguments", said and said[0]["args"] == {"name": "x", "namespace": "ai"})
+    check("a refusal from behind the endpoint is handed to the model as an error",
+          out.startswith("ERROR:") and "forbidden" in out and said[-1]["error"], out)
+    said.clear()
+    out = await gtools.dispatch("github_push_files", {"branch": "main"}, _emit)
+    check("a policy (JSON-RPC) refusal is an answer, not a crash",
+          out.startswith("ERROR:") and "refused by policy" in out and said[-1]["error"], out)
+    check("an unknown tool is refused without calling the endpoint",
+          (await gtools.dispatch("nope", {})).startswith("ERROR: unknown tool"))
+    out = await gtools.dispatch("big_output", {})
+    check("oversized output is truncated with a hint", len(out) < 9000 and "truncated" in out, len(out))
+    out = await gtools.dispatch("structured_only", {})
+    check("structured content is rendered when there is no text", '"n": 3' in out, out)
     check("without a listener, dispatch still runs",
-          isinstance(await gtools.dispatch("run_kubectl", {"args": ["get", "ns"]}), str))
-    async def _fake_ctx(u, r=3):
-        return f"WINDOW around {u} radius {r}"
-    real_ctx, gtools.get_context = gtools.get_context, _fake_ctx
-    try:
-        check("get_context dispatches with its uuid and radius",
-              await gtools.dispatch("get_context",
-                                    {"message_uuid": "abc", "radius": 5})
-              == "WINDOW around abc radius 5")
-    finally:
-        gtools.get_context = real_ctx
+          (await gtools.dispatch("memory_get_context", {"message_uuid": "abc", "radius": 5}))
+          == "WINDOW around abc radius 5")
 
-    from gateway import policy
+    inits = fake_mcp.STATE["inits"]
+    fake_mcp.STATE["expire"] = True
+    out = await gtools.dispatch("memory_get_context", {"message_uuid": "u"})
+    check("an expired session is re-initialised and the call retried",
+          out.startswith("WINDOW around u") and fake_mcp.STATE["inits"] == inits + 1, out)
+
+    real_url = gcfg.MCP_URL
+    try:
+        gcfg.MCP_URL = "http://127.0.0.1:1/mcp"
+        down = [t["function"]["name"] for t in await gtools.offered()]
+        check("an unreachable endpoint leaves only finish(), and the request still runs",
+              down == ["finish"], down)
+        gcfg.MCP_URL = ""
+        check("no endpoint configured: only finish()",
+              [t["function"]["name"] for t in await gtools.offered()] == ["finish"])
+        check("and a call explains why", (await gtools.dispatch("x", {})).startswith("ERROR"))
+    finally:
+        gcfg.MCP_URL = real_url
+    check("back on the real endpoint, the tools return", len(await gtools.offered()) > 1)
+
     merged = policy.apply([{"role": "system", "content": "You are Jeeves."},
                            {"role": "user", "content": "hi"}])
     check("policy is appended to the caller's system message, not replacing it",
           merged[0]["role"] == "system"
           and merged[0]["content"].startswith("You are Jeeves.")
-          and "get_context" in merged[0]["content"], str(merged[0])[:120])
+          and "refused" in merged[0]["content"], str(merged[0])[:120])
     check("policy does not disturb the rest of the conversation",
           merged[1:] == [{"role": "user", "content": "hi"}])
     added = policy.apply([{"role": "user", "content": "hi"}])
     check("a conversation with no system message gets one",
           added[0]["role"] == "system" and len(added) == 2)
 
-    # run_kubectl is stubbed: a test that shells out to the real cluster is
-    # not a test, it is an incident.
-    real_kubectl, gtools.run_kubectl = gtools.run_kubectl, (
-        lambda args: f"FAKE kubectl {' '.join(args)}\npod/jellyfin-0  Running")
     was_enabled, gcfg.TOOLS_ENABLED = gcfg.TOOLS_ENABLED, True
     try:
         NEXT_QUEUE[:] = [
             {"reasoning": "I should look at the pods.",
              "tool_calls": [{"id": "t1", "type": "function", "function": {
-                 "name": "run_kubectl",
-                 "arguments": '{"args": ["get", "pods", "-n", "ai"]}'}}]},
+                 "name": "kubernetes_pods_list",
+                 "arguments": '{"namespace": "ai"}'}}]},
             {"content": "One pod is running in ai: jellyfin-0."},
         ]
         obj = await chat([{"role": "user", "content": "Which pods run in ai?"}],
@@ -928,8 +751,8 @@ async def run_all():
               len(tf) == 1, str([f.name for f in capture_files()]))
         if tf:
             t = tf[0].read_text(encoding="utf-8")
-            check("tool call recorded", "Tool call · `run_kubectl`" in t)
-            check("tool result recorded", "FAKE kubectl get pods -n ai" in t)
+            check("tool call recorded", "Tool call · `kubernetes_pods_list`" in t)
+            check("tool result recorded", "FAKE pods in ai" in t)
             check("reasoning recorded", "I should look at the pods." in t)
             senders = [x[2] for x in rows(t)]
             check("every archived step still chunks with a sender",
@@ -956,8 +779,8 @@ async def run_all():
         NEXT_QUEUE[:] = [
             {"reasoning": "I need to look at the pods first.", "delay": 0.03,
              "tool_calls": [{"id": "s1", "type": "function", "function": {
-                 "name": "run_kubectl",
-                 "arguments": '{"args": ["get", "pods", "-n", "media"]}'}}]},
+                 "name": "kubernetes_pods_list",
+                 "arguments": '{"namespace": "media"}'}}]},
             {"reasoning": "jellyfin-0 is the only pod.", "delay": 0.03,
              "content": "One pod runs in media: jellyfin-0."},
         ]
@@ -968,13 +791,13 @@ async def run_all():
         check("thinking from every step reaches the client",
               "look at the pods first" in thinking and "only pod" in thinking, thinking)
         check("each tool call is announced inside the thinking",
-              "[tool] run_kubectl: kubectl get pods -n media" in thinking, thinking)
+              '[tool] kubernetes_pods_list: {"namespace": "media"}' in thinking, thinking)
         events = [o["choices"][0]["delta"]["tool_event"] for _, o in frames
                   if o.get("choices") and o["choices"][0]["delta"].get("tool_event")]
         check("each tool call streams as a structured call + result event",
               [(e["phase"], e["name"]) for e in events]
-              == [("call", "run_kubectl"), ("result", "run_kubectl")]
-              and events[0]["args"] == {"args": ["get", "pods", "-n", "media"]}
+              == [("call", "kubernetes_pods_list"), ("result", "kubernetes_pods_list")]
+              and events[0]["args"] == {"namespace": "media"}
               and not events[0]["mutating"], str(events))
         check("the answer is streamed and complete",
               answer == "One pod runs in media: jellyfin-0.", repr(answer))
@@ -999,8 +822,8 @@ async def run_all():
         if sf:
             st = sf[0].read_text(encoding="utf-8")
             check("with its tool call and result",
-                  "Tool call · `run_kubectl`" in st
-                  and "FAKE kubectl get pods -n media" in st)
+                  "Tool call · `kubernetes_pods_list`" in st
+                  and "FAKE pods in media" in st)
 
         NEXT_QUEUE[:] = [
             {"tool_calls": [{"id": "f2", "type": "function", "function": {
@@ -1037,150 +860,13 @@ async def run_all():
               content[:200])
     finally:
         gcfg.TOOLS_ENABLED = was_enabled
-        gtools.run_kubectl = real_kubectl
         NEXT_QUEUE.clear()
 
 
 
-async def run_git():
-    print("\n[12] git tools: read, and propose changes only as PRs")
-    import gateway.config as gcfg
-    import gateway.gittools as git
-    import gateway.tools as gtools
-    gh_reset()
-    saved = (gcfg.GIT_TOKEN, gcfg.GIT_API)
-    gcfg.GIT_API = "http://127.0.0.1:18000/gh"
-    try:
-        gcfg.GIT_TOKEN = ""
-        check("no token: git tools are not offered at all",
-              not ({t["function"]["name"] for t in gtools.offered()} & git.NAMES))
-        check("no token: a git call explains what is missing",
-              "not configured" in await git.list_files("Whitehorse"))
-        gcfg.GIT_TOKEN = "ghtest"
-        check("with a token: git tools are offered",
-              git.NAMES <= {t["function"]["name"] for t in gtools.offered()})
-        import tempfile as _tf, os as _os
-        tok = _tf.NamedTemporaryFile("w", delete=False); tok.write("fromfile\n"); tok.close()
-        saved_env, saved_file = gcfg.GIT_TOKEN, gcfg.GIT_TOKEN_FILE
-        gcfg.GIT_TOKEN, gcfg.GIT_TOKEN_FILE = "", tok.name
-        check("a mounted token file is read without a restart", gcfg.git_token() == "fromfile")
-        with open(tok.name, "w") as fh: fh.write("rotated")
-        _os.utime(tok.name, (1, 1))
-        check("and a rotated one is picked up", gcfg.git_token() == "rotated")
-        gcfg.GIT_TOKEN_FILE = tok.name + ".missing"
-        check("a missing file means no token", gcfg.git_token() == "")
-        gcfg.GIT_TOKEN, gcfg.GIT_TOKEN_FILE = saved_env, saved_file
-
-        out = await git.list_files("whitehorse", "kubernetes/apps")
-        check("list is filtered by prefix, repo name case-insensitive",
-              "sonarr/helmrelease.yaml" in out and "README" not in out, out)
-        out = await git.read_file("Whitehorse", "kubernetes/apps/media/sonarr/helmrelease.yaml")
-        check("read returns the file with a line header", "lines 1-4 of 4" in out
-              and "memory: 512Mi" in out, out)
-        check("a repo outside the allowlist is refused",
-              (await git.read_file("upbound-official-build", "x")).startswith("REFUSED"))
-        check("search finds text", "sonarr" in await git.search("Whitehorse", "512Mi"))
-
-        path = "kubernetes/apps/media/sonarr/helmrelease.yaml"
-        out = await git.open_pr("Whitehorse", "fix(media): raise sonarr memory",
-                                "evidence here",
-                                [{"path": path, "old": "memory: 512Mi", "new": "memory: 768Mi"}])
-        check("an edit opens a PR", out.startswith("opened PR #1"), out)
-        pr = GH["pulls"][0]
-        branch = pr["head"]["ref"]
-        check("on an agent/ branch, against main",
-              branch.startswith("agent/fix-media-raise-sonarr-memory-") and pr["base"] == "main", branch)
-        check("main is untouched", "512Mi" in GH["trees"][GH["commits"][GH["branches"]["main"]]["tree"]][path])
-        check("the branch has the edit",
-              "768Mi" in GH["trees"][GH["commits"][GH["branches"][branch]]["tree"]][path])
-        check("the PR body says a human merges", "Nothing merges without a human" in pr["body"])
-
-        out = await git.open_pr("Whitehorse", "fix(media): raise sonarr memory more", "again",
-                                [{"path": path, "old": "768Mi", "new": "1Gi"}], branch=branch)
-        check("revising its own branch updates the same PR, no second PR",
-              "updating PR #1" in out and len(GH["pulls"]) == 1, out)
-        check("revision reads the branch, not main",
-              "1Gi" in GH["trees"][GH["commits"][GH["branches"][branch]]["tree"]][path])
-
-        async def refused(label, **kw):
-            args = dict(repo="Whitehorse", title="chore: something reasonable", body="b",
-                        changes=[{"path": "README.md", "old": "hello", "new": "bye"}])
-            args.update(kw)
-            o = await git.open_pr(**args)
-            check(label, o.startswith("REFUSED"), o)
-        before = dict(GH["branches"])
-        await refused("never commits to main", branch="main")
-        await refused("never commits to a non-agent branch", branch="feature/x")
-        await refused("an ambiguous or missing `old` is refused",
-                      changes=[{"path": "README.md", "old": "nope", "new": "x"}])
-        await refused("SOPS files are refused",
-                      changes=[{"path": "kubernetes/apps/ai/llm-api-key.sops.yaml", "content": "x"}])
-        await refused("CI workflows are refused",
-                      changes=[{"path": ".github/workflows/build.yml", "content": "x"}])
-        await refused("an edit that breaks YAML is refused",
-                      changes=[{"path": path, "old": "spec:", "new": "spec: ["}])
-        await refused("path traversal is refused",
-                      changes=[{"path": "../etc/passwd", "content": "x"}])
-        check("and none of the refusals wrote anything", GH["branches"] == before)
-
-        out = await git.open_pr("Whitehorse", "docs: add a note file", "new file",
-                                [{"path": "docs/note.md", "content": "note\n"},
-                                 {"path": "README.md", "delete": True}])
-        files = GH["trees"][GH["commits"][GH["branches"][GH["pulls"][-1]["head"]["ref"]]]["tree"]]
-        check("create and delete in one PR", files.get("docs/note.md") == "note\n"
-              and "README.md" not in files, str(sorted(files)))
-        check("list_prs shows only agent PRs",
-              "#1" in await git.list_prs("Whitehorse"))
-
-        said = []
-        async def _emit(d): said.append(d["tool_event"])
-        await gtools.dispatch("git_read_file", {"repo": "Whitehorse", "path": "README.md"}, _emit)
-        check("a git read is not a mutation", not any(e["mutating"] for e in said), str(said))
-        said.clear()
-        await gtools.dispatch("git_open_pr", {"repo": "Whitehorse", "title": "chore: announce test",
-                              "body": "b", "changes": [{"path": "x.md", "content": "x"}]}, _emit)
-        check("opening a PR is reported like any other action",
-              len(said) == 2 and all(e["mutating"] for e in said)
-              and said[0]["name"] == "git_open_pr" and "opened PR" in said[1]["summary"], str(said))
-        check("the token never appears in any output",
-              not any("ghtest" in str(v) for v in (out, said)))
-    finally:
-        gcfg.GIT_TOKEN, gcfg.GIT_API = saved
-
-
-async def run_observe_and_proxy() -> None:
+async def run_proxy() -> None:
     AUTH = {"Authorization": "Bearer testkey"}
-    print("\n[observe] read-only Prometheus / Alertmanager tools")
     import gateway.config as gcfg
-    import gateway.tools as gtools
-    saved = (gcfg.PROMETHEUS_URL, gcfg.ALERTMANAGER_URL)
-    gcfg.PROMETHEUS_URL = "http://127.0.0.1:18000/prom"
-    gcfg.ALERTMANAGER_URL = "http://127.0.0.1:18000/am"
-    try:
-        names = {t["function"]["name"] for t in gtools.offered()}
-        check("the read-only tools are offered",
-              {"prometheus_query", "prometheus_query_range", "list_alerts", "list_silences"} <= names, names)
-        for n in ("prometheus_query", "prometheus_query_range", "list_alerts", "list_silences"):
-            check(f"{n} is not an action", not gtools.is_mutation(n, {}))
-        out = await gtools.dispatch("prometheus_query", {"query": "up"})
-        check("an instant query renders one line per series",
-              '2 series' in out and 'up{job="node"} 0' in out, out)
-        out = await gtools.dispatch("prometheus_query", {"query": "bad("})
-        check("a bad query reports Prometheus' error", "parse error" in out, out)
-        out = await gtools.dispatch("prometheus_query_range", {"query": "restarts", "minutes": 5})
-        check("a range query summarises and shows where it changed",
-              'pod="shared-pg-3"' in out and "max=8" in out and "=3" in out, out)
-        out = await gtools.dispatch("list_alerts", {})
-        check("alerts list shows state, silenced ones marked",
-              "KubePodCrashLooping [active]" in out and "(silenced)" in out, out)
-        out = await gtools.dispatch("list_silences", {})
-        check("silences list shows only live silences", "s1 [active]" in out and "s0" not in out, out)
-        gcfg.PROMETHEUS_URL = gcfg.ALERTMANAGER_URL = ""
-        check("unconfigured: the tools are not offered",
-              "prometheus_query" not in {t["function"]["name"] for t in gtools.offered()})
-    finally:
-        gcfg.PROMETHEUS_URL, gcfg.ALERTMANAGER_URL = saved
-
     print("\n[proxy] encoding and client disconnects")
     async with httpx.AsyncClient(timeout=10) as c:
         r = await c.get(f"{PROXY}/", headers={"Accept-Encoding": "gzip"})
@@ -1240,8 +926,7 @@ async def main() -> int:
         await asyncio.sleep(0.05)
     try:
         await run_all()
-        await run_git()
-        await run_observe_and_proxy()
+        await run_proxy()
     finally:
         up.should_exit = px.should_exit = True
         await asyncio.gather(t1, t2, return_exceptions=True)
