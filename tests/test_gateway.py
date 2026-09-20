@@ -49,6 +49,7 @@ PROXY = "http://127.0.0.1:18010"
 NEXT: dict = {}
 NEXT_QUEUE: list = []   # popped per upstream call, for multi-step loops
 FAILURES: list = []
+BAD_HISTORY: list = []   # requests llama.cpp would have refused
 
 fake = FastAPI()
 
@@ -105,6 +106,16 @@ async def completions(request: Request):
             {"index": 0, "finish_reason": "stop", "message": {
                 "role": "assistant",
                 "content": "STATE: user is migrating the cluster; PVCs renamed."}}]}
+    # Like llama.cpp: a history whose tool-call arguments are not JSON cannot
+    # be rendered into the chat template, and every request carrying it fails.
+    for m in body.get("messages") or []:
+        for c in m.get("tool_calls") or []:
+            try:
+                json.loads((c.get("function") or {}).get("arguments") or "{}")
+            except ValueError:
+                BAD_HISTORY.append(c)
+                return JSONResponse({"error": {"code": 500, "message":
+                    "Failed to parse tool call arguments as JSON"}}, status_code=500)
     spec = NEXT_QUEUE.pop(0) if NEXT_QUEUE else dict(NEXT)
     if spec.get("status"):
         return JSONResponse({"error": {"message": "fake failure"}},
@@ -845,6 +856,34 @@ async def run_all():
         check("a finish() report is delivered as streamed content",
               deltas(frames, "content") == "Streamed report.",
               repr(deltas(frames, "content")))
+
+        # max_tokens landing mid-tool-call: the arguments arrive cut off. The
+        # call must not run (it would run with {}), and the conversation must
+        # stay renderable, or llama.cpp 500s every later step and the run dies
+        # (2026-09-20: HA incident, "Failed to parse tool call arguments").
+        import fake_mcp as _fm
+        before = list(_fm.STATE["calls"])
+        BAD_HISTORY.clear()
+        NEXT_QUEUE[:] = [
+            {"tool_calls": [{"id": "c1", "type": "function", "function": {
+                "name": "kubernetes_pods_get",
+                "arguments": '{"namespace": "smart-h'}}]},
+            {"tool_calls": [{"id": "c2", "type": "function", "function": {
+                "name": "kubernetes_pods_list",
+                "arguments": '{"namespace": "smart-home"}'}}]},
+            {"content": "Home Assistant is crash-looping."},
+        ]
+        frames = await stream_frames(
+            [{"role": "user", "content": "Cut-off tool call."}], AUTH)
+        ran = _fm.STATE["calls"][len(before):]
+        check("a cut-off tool call is not run",
+              [n for n, _ in ran] == ["kubernetes_pods_list"], str(ran))
+        check("and the conversation stays renderable for the model server",
+              not BAD_HISTORY, str(BAD_HISTORY)[:200])
+        check("the run carries on to an answer",
+              "crash-looping" in deltas(frames, "content"),
+              repr(deltas(frames, "content"))[:200])
+        NEXT_QUEUE.clear()
 
         NEXT_QUEUE[:] = [{"status": 500}, {"status": 500}, {"status": 500}]
         frames = await stream_frames(
