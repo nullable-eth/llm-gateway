@@ -145,7 +145,8 @@ NOTHING_SAID = "(no summary given)"
 
 def _render_finish(args: dict) -> str:
     out = [str(args.get("summary") or "").strip()]
-    for label, key in (("Actions taken", "actions_taken"), ("Proposals", "proposals")):
+    for label, key in (("Actions taken", "actions_taken"), ("Proposals", "proposals"),
+                       ("Capability gaps", "capability_gaps")):
         items = args.get(key) or []
         if isinstance(items, str):
             items = [items]
