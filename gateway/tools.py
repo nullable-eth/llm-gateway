@@ -26,7 +26,12 @@ FINISH = {"type": "function", "function": {"name": "finish",
         "summary": {"type": "string", "description": "what happened and root cause"},
         "actions_taken": {"type": "array", "items": {"type": "string"}},
         "proposals": {"type": "array", "items": {"type": "string"},
-            "description": "changes a human should make or approve, exactly"}},
+            "description": "changes a human should make or approve, exactly"},
+        "capability_gaps": {"type": "array", "items": {"type": "string"},
+            "description": "anything you could not do here that a tool, permission or "
+                           "documented procedure would have let you do, one per item: what you "
+                           "needed, what stopped you (the exact refusal or missing tool), and "
+                           "the smallest thing that would fix it. Empty if nothing was missing"}},
         "required": ["summary"]}}}
 
 

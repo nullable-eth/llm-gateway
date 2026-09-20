@@ -676,6 +676,10 @@ async def run_all():
     import gateway.agentloop as gloop
     check("a finish with a summary renders it",
           gloop._render_finish({"summary": "it was DNS"}) == "it was DNS")
+    check("a capability gap is reported under its own heading",
+          "Capability gaps" in gloop._render_finish(
+              {"summary": "x", "capability_gaps": ["no tool to clear an SMB attribute"]}),
+          gloop._render_finish({"summary": "x", "capability_gaps": ["no tool"]}))
     check("an empty finish is recognised as saying nothing",
           gloop._render_finish({}) == gloop.NOTHING_SAID, gloop._render_finish({}))
     check("and so is one with only blank fields",
