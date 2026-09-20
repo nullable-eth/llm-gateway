@@ -242,6 +242,35 @@ async def run(client, upstream: str, body: dict, auth: str, compactor,
             raise UpstreamError(f"model server returned {status}: {err[:300]}")
         msg = ((last.get("choices") or [{}])[0].get("message") or {})
         calls = msg.get("tool_calls") or []
+        # A tool call whose arguments are not valid JSON was cut off, almost
+        # always by max_tokens landing mid-call after a long think. It must
+        # neither run nor stay in the history as-is:
+        #  - run, it executes with {} (every argument silently dropped), which
+        #    is how `kubernetes_pods_get` came to be called with no name;
+        #  - kept, llama.cpp cannot render the conversation back into the
+        #    template and answers every later step with the same 500 ("Failed
+        #    to parse tool call arguments as JSON"). Resampling cannot fix
+        #    that: the broken JSON is in the REQUEST, so all three attempts
+        #    fail in under a second and the whole run is lost.
+        # So the history gets "{}" in its place, and the model is told what
+        # happened and asked to make the call again.
+        broken = {}
+        for call in calls:
+            fn = call.get("function") or {}
+            raw = fn.get("arguments")
+            if isinstance(raw, dict):
+                continue
+            try:
+                ok = isinstance(json.loads(raw or "{}"), dict)
+            except ValueError:
+                ok = False
+            if not ok:
+                broken[id(call)] = str(raw or "")
+                call["function"] = dict(fn, arguments="{}")
+        if broken:
+            finish = ((last.get("choices") or [{}])[0].get("finish_reason")) or "?"
+            log.warning("agentloop: step %d produced %d cut-off tool call(s) (finish_reason=%s)",
+                        step, len(broken), finish)
 
         assistant = {"role": "assistant", "content": msg.get("content") or ""}
         if msg.get("reasoning_content"):
@@ -307,6 +336,17 @@ async def run(client, upstream: str, body: dict, auth: str, compactor,
 
         for call in calls:
             name = (call.get("function") or {}).get("name") or ""
+            if id(call) in broken:
+                cut = broken[id(call)]
+                out = ("ERROR: this call to %s was cut off before its arguments were complete "
+                       "(received: %s), so it was NOT run. Make the call again with complete "
+                       "arguments, and keep your thinking before a tool call short: the reply "
+                       "has a length limit and the call comes last."
+                       % (name, json.dumps(cut[:200])))
+                log.info("tool %s NOT run: cut-off arguments", name)
+                messages.append({"role": "tool", "tool_call_id": call.get("id") or "",
+                                 "content": out})
+                continue
             if emit is not None:
                 await emit({"reasoning_content": _describe(name, _args_of(call))})
             out = await tools.dispatch(name, _args_of(call), emit)
