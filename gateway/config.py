@@ -184,3 +184,15 @@ TOOL_READ_ONLY_PATTERN = os.environ.get("TOOL_READ_ONLY_PATTERN", "")
 TOOL_READ_ONLY_RE = re.compile(TOOL_READ_ONLY_PATTERN) if TOOL_READ_ONLY_PATTERN else None
 # The endpoint's own instructions are appended to the tool policy, capped.
 MCP_INSTRUCTIONS_MAX = int(os.environ.get("MCP_INSTRUCTIONS_MAX", "4000"))
+
+# --------------------------------------------------------------------- packs
+# Capability packs: on-demand tool + runbook loading (gateway/packs.py). Off
+# unless a pack config is supplied. When on, the model is offered finish() +
+# load_capability() plus a manifest of packs, and loads the tools a task needs
+# instead of carrying the whole surface on every call. MCP_PACKS is inline JSON
+# {name: {match: [glob...], when: "load me when…", runbook|runbook_file: ...}};
+# MCP_PACKS_FILE points at the same JSON on disk; runbook_file names are read
+# from MCP_RUNBOOKS_DIR. Empty = every tool offered on every call (legacy).
+MCP_PACKS = os.environ.get("MCP_PACKS", "").strip()
+MCP_PACKS_FILE = os.environ.get("MCP_PACKS_FILE", "").strip()
+MCP_RUNBOOKS_DIR = os.environ.get("MCP_RUNBOOKS_DIR", "").strip()

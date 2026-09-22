@@ -17,7 +17,7 @@ It is appended to the caller's own system message rather than replacing it, so
 whatever persona or instructions the client set still lead. Set
 TOOL_SYSTEM_PROMPT="" to disable.
 """
-from . import config, tools
+from . import config, packs, tools
 
 DEFAULT = """\
 You have tools. Spend them deliberately — the budget is limited and each call \
@@ -49,8 +49,14 @@ def text() -> str:
     base = DEFAULT if config.TOOL_SYSTEM_PROMPT == "__default__" else config.TOOL_SYSTEM_PROMPT
     if not base:
         return ""
+    parts = [base]
+    manifest = packs.manifest()          # empty unless packs are configured
+    if manifest:
+        parts.append(manifest)
     extra = tools.instructions().strip()
-    return base + ("\n\nTool server notes:\n" + extra if extra else "")
+    if extra:
+        parts.append("Tool server notes:\n" + extra)
+    return "\n\n".join(parts)
 
 
 def apply(messages: list) -> list:

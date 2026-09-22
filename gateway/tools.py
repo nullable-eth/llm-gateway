@@ -13,7 +13,7 @@ after as a `tool_event`, and every call that may change something is logged.
 import json
 import logging
 
-from . import config, mcpclient
+from . import config, mcpclient, packs
 
 log = logging.getLogger("gateway")
 
@@ -34,13 +34,64 @@ FINISH = {"type": "function", "function": {"name": "finish",
                            "the smallest thing that would fix it. Empty if nothing was missing"}},
         "required": ["summary"]}}}
 
+# Deferred loading's one meta-tool (packs.py). agentloop intercepts it like
+# finish(): it is never dispatched to the endpoint. Offered only when packs are
+# configured; otherwise every tool is offered directly and this is absent.
+LOAD_CAPABILITY = {"type": "function", "function": {"name": "load_capability",
+    "description": "Load a capability: adds its tools and its runbook to this run so you can use "
+                   "them. Load only what the task needs; load another later if the task turns out "
+                   "to need it. See the capability list in your instructions.",
+    "parameters": {"type": "object", "properties": {
+        "name": {"type": "string", "description": "the capability to load"}},
+        "required": ["name"]}}}
 
-async def offered() -> list:
-    """The tools handed to the model on this call."""
+
+async def offered(loaded: "set[str] | None" = None) -> list:
+    """The tools handed to the model on this call.
+
+    Legacy (no packs configured): every MCP tool, plus finish(). With packs
+    configured, the deferred surface: finish() + load_capability() + the tools
+    of whatever capabilities this run has loaded so far."""
     client = mcpclient.get()
     if client is None:
         return [FINISH]
-    return [mcpclient.to_openai(t) for t in await client.list_tools()] + [FINISH]
+    all_tools = await client.list_tools()
+    if not packs.enabled():
+        return [mcpclient.to_openai(t) for t in all_tools] + [FINISH]
+    out = [FINISH, LOAD_CAPABILITY]
+    seen: set = set()
+    for name in (loaded or set()):
+        for t in packs.tools_for(name, all_tools):
+            n = t.get("name")
+            if n and n not in seen:
+                seen.add(n)
+                out.append(mcpclient.to_openai(t))
+    return out
+
+
+async def apply_load(name: str, loaded: "set[str]") -> str:
+    """Handle a load_capability() call: add the pack's tools to `loaded` and
+    return its runbook. Fails loud when a pack resolves to zero tools — that is
+    the silent-degradation mode (a dropped upstream) the manifest warns about,
+    so it must reach the model as an error, not an empty success."""
+    name = (name or "").strip()
+    p = packs.get(name)
+    if not p:
+        avail = ", ".join(packs.names()) or "(none configured)"
+        return f"ERROR: no capability '{name}'. Available: {avail}."
+    if name in loaded:
+        return f"Capability '{name}' is already loaded."
+    client = mcpclient.get()
+    all_tools = await client.list_tools() if client else []
+    matched = packs.tools_for(name, all_tools)
+    if not matched:
+        return (f"ERROR: capability '{name}' loaded NO tools — the server(s) behind it may be "
+                f"unavailable right now (nothing the endpoint lists matched {p.match}). This is "
+                f"not proof the capability is gone; report it if it blocks the task.")
+    loaded.add(name)
+    names = ", ".join(sorted(str(t.get("name") or "") for t in matched))
+    head = f"Loaded capability '{name}' — {len(matched)} tool(s) now available: {names}."
+    return head + ("\n\n" + p.runbook if p.runbook else "")
 
 
 def instructions() -> str:
