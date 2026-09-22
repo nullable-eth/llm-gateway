@@ -23,7 +23,7 @@ import time
 
 import httpx
 
-from . import config, tools
+from . import config, packs, tools
 from .capture.sse import ChatAccumulator
 
 log = logging.getLogger("gateway")
@@ -172,6 +172,7 @@ async def run(client, upstream: str, body: dict, auth: str, compactor,
     deadline = started + config.TOOL_MAX_SECONDS
     hard_deadline = started + config.REQUEST_MAX_SECONDS
     asked_again = False          # one nudge, for a turn that came back empty
+    loaded: set = set()          # capabilities loaded so far (deferred mode; packs.py)
 
     for step in range(config.TOOL_MAX_STEPS):
         # Tools are withdrawn on the last step, or once the wall-clock budget
@@ -191,8 +192,11 @@ async def run(client, upstream: str, body: dict, auth: str, compactor,
         call_body = dict(body)
         call_body["messages"] = messages
         call_body["stream"] = False
+        offered_names: set = set()
         if offer_tools:
-            call_body["tools"] = await tools.offered()
+            offered_defs = await tools.offered(loaded)
+            call_body["tools"] = offered_defs
+            offered_names = {(d.get("function") or {}).get("name") for d in offered_defs}
         else:
             call_body.pop("tools", None)
             messages = messages + [{"role": "user", "content":
@@ -345,6 +349,30 @@ async def run(client, upstream: str, body: dict, auth: str, compactor,
                        "has a length limit and the call comes last."
                        % (name, json.dumps(cut[:200])))
                 log.info("tool %s NOT run: cut-off arguments", name)
+                messages.append({"role": "tool", "tool_call_id": call.get("id") or "",
+                                 "content": out})
+                continue
+            # load_capability is a gateway meta-tool (deferred loading), never
+            # dispatched to the endpoint: it adds a pack's tools to `loaded`, so
+            # the NEXT step's offered() carries them, and returns the runbook.
+            if name == "load_capability":
+                if emit is not None:
+                    await emit({"reasoning_content": _describe(name, _args_of(call))})
+                out = await tools.apply_load(_args_of(call).get("name"), loaded)
+                log.info("load_capability(%s) -> %s", _args_of(call).get("name"),
+                         "error" if out.startswith("ERROR") else "ok")
+                messages.append({"role": "tool", "tool_call_id": call.get("id") or "",
+                                 "content": out})
+                continue
+            # In deferred mode only what has been loaded is offered, so a call to
+            # anything else means the model reached for an unloaded capability.
+            # Tell it to load first rather than dispatching (legacy mode offers
+            # everything, so offered_names holds it and this never fires).
+            if packs.enabled() and name not in offered_names:
+                out = ("ERROR: '%s' is not available — it belongs to a capability you have not "
+                       "loaded. Call load_capability(...) for the capability that provides it "
+                       "first; see the capability list in your instructions." % name)
+                log.info("tool %s blocked: capability not loaded", name)
                 messages.append({"role": "tool", "tool_call_id": call.get("id") or "",
                                  "content": out})
                 continue

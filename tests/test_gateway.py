@@ -915,6 +915,78 @@ async def run_all():
         gcfg.TOOLS_ENABLED = was_enabled
         NEXT_QUEUE.clear()
 
+    # --------------------------------------------------------------- [12]
+    print("\n[12] capability packs (on-demand tool loading)")
+    import gateway.packs as gpacks
+    PACKS = {
+        "cluster": {"match": ["kubernetes_*", "memory_*"], "when": "cluster ops",
+                    "runbook": "Use kubectl carefully; the NAS is the hard line."},
+        "code": {"match": ["github_*"], "when": "git and pull requests",
+                 "runbook": "PRs only; never commit to main."},
+        "ghost": {"match": ["nothing_here_*"], "when": "matches no live tool",
+                  "runbook": "unused"},
+    }
+    was_packs = gcfg.MCP_PACKS
+    gcfg.MCP_PACKS = json.dumps(PACKS)
+    gpacks.reload()
+    try:
+        check("packs enabled once configured", gpacks.enabled())
+        base = [t["function"]["name"] for t in await gtools.offered(set())]
+        check("deferred: only finish + load_capability offered at the start",
+              base == ["finish", "load_capability"], base)
+        loaded = set()
+        out = await gtools.apply_load("cluster", loaded)
+        check("loading a pack reports its tools and returns its runbook",
+              "kubernetes_pods_list" in out and "NAS is the hard line" in out
+              and "cluster" in loaded, out[:200])
+        after = [t["function"]["name"] for t in await gtools.offered(loaded)]
+        check("its tools are offered, other packs' are not",
+              "kubernetes_pods_list" in after and "memory_get_context" in after
+              and "github_push_files" not in after, after)
+        check("finish and load_capability stay offered",
+              "finish" in after and "load_capability" in after, after)
+        again = await gtools.apply_load("cluster", loaded)
+        check("loading an already-loaded pack is a no-op message",
+              "already loaded" in again, again)
+        unknown = await gtools.apply_load("nope", set())
+        check("loading an unknown capability lists the valid ones",
+              unknown.startswith("ERROR") and "cluster" in unknown and "code" in unknown,
+              unknown)
+        empty = set()
+        ghost = await gtools.apply_load("ghost", empty)
+        check("a pack matching no live tool FAILS LOUD, not silently empty",
+              ghost.startswith("ERROR") and "NO tools" in ghost and "ghost" not in empty,
+              ghost)
+        check("the capability manifest is injected into the policy",
+              "load_capability" in policy.text() and "cluster: cluster ops" in policy.text(),
+              policy.text()[-400:])
+
+        was_enabled2, gcfg.TOOLS_ENABLED = gcfg.TOOLS_ENABLED, True
+        try:
+            NEXT_QUEUE[:] = [
+                {"tool_calls": [{"id": "d0", "type": "function", "function": {
+                    "name": "kubernetes_pods_list", "arguments": '{"namespace": "ai"}'}}]},
+                {"tool_calls": [{"id": "d1", "type": "function", "function": {
+                    "name": "load_capability", "arguments": '{"name": "cluster"}'}}]},
+                {"tool_calls": [{"id": "d2", "type": "function", "function": {
+                    "name": "kubernetes_pods_list", "arguments": '{"namespace": "ai"}'}}]},
+                {"content": "One pod runs in ai: jellyfin-0."},
+            ]
+            before = len(fake_mcp.STATE["calls"])
+            obj = await chat([{"role": "user", "content": "Which pods run in ai?"}],
+                             stream=False, headers=AUTH)
+            ran = [n for n, _ in fake_mcp.STATE["calls"][before:]]
+            check("deferred loop: the unloaded call is blocked, the endpoint is hit "
+                  "only after load", ran == ["kubernetes_pods_list"], str(ran))
+            check("and the run reaches its answer",
+                  "jellyfin-0" in (obj["choices"][0]["message"].get("content") or ""),
+                  str(obj)[:200])
+        finally:
+            gcfg.TOOLS_ENABLED = was_enabled2
+            NEXT_QUEUE.clear()
+    finally:
+        gcfg.MCP_PACKS = was_packs
+        gpacks.reload()
 
 
 async def run_proxy() -> None:
