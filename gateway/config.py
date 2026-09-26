@@ -142,6 +142,9 @@ UPSTREAM_MIN_TIMEOUT_S = int(os.environ.get("UPSTREAM_MIN_TIMEOUT_S", "30"))
 # leaves 2 minutes of headroom.
 ANSWER_TIMEOUT_S = int(os.environ.get("ANSWER_TIMEOUT_S", "240"))
 TOOL_OUTPUT_MAX = int(os.environ.get("TOOL_OUTPUT_MAX", "8000"))
+# How many times a step cut off by max_tokens before it called anything is
+# nudged to act, tools still offered, before it is treated as the answer.
+LENGTH_CUT_RETRIES = int(os.environ.get("LENGTH_CUT_RETRIES", "3"))
 # Guidance injected with the tools. The client never asked for the tools and
 # cannot know how to budget them, so the policy travels with them. Empty
 # disables. Default lives in policy.py.

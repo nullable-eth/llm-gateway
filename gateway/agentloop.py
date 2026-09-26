@@ -172,6 +172,7 @@ async def run(client, upstream: str, body: dict, auth: str, compactor,
     deadline = started + config.TOOL_MAX_SECONDS
     hard_deadline = started + config.REQUEST_MAX_SECONDS
     asked_again = False          # one nudge, for a turn that came back empty
+    length_cuts = 0              # steps cut off by max_tokens before acting
     loaded: set = set()          # capabilities loaded so far (deferred mode; packs.py)
 
     for step in range(config.TOOL_MAX_STEPS):
@@ -283,6 +284,25 @@ async def run(client, upstream: str, body: dict, auth: str, compactor,
         if calls:
             assistant["tool_calls"] = calls
         messages.append(assistant)
+
+        # A step that ran into max_tokens before calling anything is not an
+        # answer and not a reason to stop. 2026-09-26: the agent thought for a
+        # whole 8k-token step about how to rebuild a truncated file, got cut off
+        # with no content, fell into the empty-answer path below, lost its
+        # tools for good, and reported "budget ran out" 5 calls into an 80-call
+        # budget. Keep the tools and tell it to act.
+        finish_reason = ((last.get("choices") or [{}])[0].get("finish_reason")) or ""
+        if (not calls and finish_reason == "length" and offer_tools
+                and length_cuts < config.LENGTH_CUT_RETRIES):
+            length_cuts += 1
+            log.info("agentloop: step %d cut off by max_tokens before acting (%d/%d); "
+                     "continuing with tools", step, length_cuts, config.LENGTH_CUT_RETRIES)
+            messages.append({"role": "user", "content":
+                             "Your reply hit the per-step length limit and was cut off before "
+                             "you acted, so nothing ran. Continue from where you were, without "
+                             "re-planning: make the next tool call now and keep the thinking "
+                             "before it short, or give your answer if you already have it."})
+            continue
 
         if not calls:
             # An empty message is not an answer either. This model puts its

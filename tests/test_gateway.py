@@ -128,7 +128,7 @@ async def completions(request: Request):
             msg["tool_calls"] = spec["tool_calls"]
         return {"id": "x", "model": "qwen3.8-27b",
                 "choices": [{"index": 0, "message": msg,
-                             "finish_reason": "stop"}],
+                             "finish_reason": spec.get("finish", "stop")}],
                 "usage": {"prompt_tokens": 11, "completion_tokens": 22}}
 
     async def gen():
@@ -147,7 +147,7 @@ async def completions(request: Request):
             for piece in _pieces(call["function"]["arguments"], 5):
                 yield _frame({"tool_calls": [
                     {"index": i, "function": {"arguments": piece}}]})
-        yield _frame({}, finish="stop")
+        yield _frame({}, finish=spec.get("finish", "stop"))
         yield b"data: [DONE]\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
@@ -886,6 +886,32 @@ async def run_all():
               not BAD_HISTORY, str(BAD_HISTORY)[:200])
         check("the run carries on to an answer",
               "crash-looping" in deltas(frames, "content"),
+              repr(deltas(frames, "content"))[:200])
+        NEXT_QUEUE.clear()
+
+        # max_tokens landing in the THINKING, before any call: no content, no
+        # call, finish_reason "length". Not an answer — the tools stay and the
+        # model is told to act (2026-09-26: this ended a PR run 5 calls into
+        # an 80-call budget as "budget ran out").
+        before = list(_fm.STATE["calls"])
+        NEXT_QUEUE[:] = [
+            {"reasoning": "Let me think about the file... " * 20, "finish": "length"},
+            {"tool_calls": [{"id": "l1", "type": "function", "function": {
+                "name": "kubernetes_pods_list",
+                "arguments": '{"namespace": "monitoring"}'}}]},
+            {"content": "PR opened."},
+        ]
+        frames = await stream_frames(
+            [{"role": "user", "content": "Length-cut thinking."}], AUTH)
+        ran = _fm.STATE["calls"][len(before):]
+        check("a step cut off in its thinking keeps its tools",
+              [n for n, _ in ran] == ["kubernetes_pods_list"], str(ran))
+        check("and the model is told to act, not to answer",
+              "cut off before you acted" in json.dumps(LAST_UPSTREAM)
+              and "tool budget is spent" not in json.dumps(LAST_UPSTREAM),
+              json.dumps(LAST_UPSTREAM)[-300:])
+        check("the run carries on to its answer",
+              "PR opened." in deltas(frames, "content"),
               repr(deltas(frames, "content"))[:200])
         NEXT_QUEUE.clear()
 
