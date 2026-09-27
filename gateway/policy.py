@@ -20,9 +20,9 @@ TOOL_SYSTEM_PROMPT="" to disable.
 from . import config, packs, tools
 
 DEFAULT = """\
-You have tools, and dozens of calls to spend. A call is cheaper than reasoning \
-about what it might return: when unsure, make the call. Keep the thinking \
-before each call short — a step has a length limit and the call comes last.
+You have tools, with no limit on calls, steps or time: take as many as the \
+task needs to finish it. A call is cheaper than reasoning about what it might \
+return — when unsure, make the call rather than deliberate.
 
 - What you may do is decided by the permissions behind each tool, not by \
 these instructions. If a call is refused, the refusal is the answer: do not \

@@ -16,6 +16,8 @@ and this is the same job cluster-agent's trim_old_results() did before the
 gateway took it over.
 """
 import asyncio
+import hashlib
+import itertools
 import json
 import logging
 import random
@@ -42,28 +44,32 @@ def _describe(name: str, args: dict) -> str:
     return f"\n\n[tool] {name}: {detail}\n\n"
 
 
-async def _post(client, url: str, body: dict, headers: dict, budget: float, emit):
+async def _noop(_delta):
+    return None
+
+
+async def _post(client, url: str, body: dict, headers: dict, budget, emit):
     """One model call. Returns (status, response dict or None, error text).
 
-    Without `emit` it is the plain non-streamed call. With it, the call is
-    streamed and every reasoning/content delta is handed to `emit` as it
-    arrives, then the step is reassembled into the same dict shape a
-    non-streamed call returns, so the loop cannot tell the difference. Tool
-    call fragments are NOT forwarded: the client never asked for tools.
+    Always streamed from upstream, whether or not the caller streams: a stream
+    is what makes a hang detectable. The read timeout is per chunk, so
+    STEP_IDLE_TIMEOUT_S bounds silence, not work — a step may think for as
+    long as it likes as long as tokens keep coming. `budget`, when not None,
+    additionally bounds the whole call (only when a deadline is configured).
+    Every reasoning/content delta goes to `emit` as it arrives, then the step
+    is reassembled into the dict shape a non-streamed call returns. Tool call
+    fragments are NOT forwarded: the client never asked for tools.
     """
-    if emit is None:
-        r = await client.post(url, json=body, headers=headers, timeout=budget)
-        if r.status_code >= 400:
-            return r.status_code, None, r.text
-        return r.status_code, r.json(), ""
-
+    emit = emit or _noop
     body = dict(body, stream=True)
+    timeout = httpx.Timeout(config.STEP_IDLE_TIMEOUT_S or None,
+                            connect=config.CONNECT_TIMEOUT_S)
     acc = ChatAccumulator()
     tail: dict = {}
 
     async def consume():
         async with client.stream("POST", url, json=body, headers=headers,
-                                 timeout=budget) as r:
+                                 timeout=timeout) as r:
             if r.status_code >= 400:
                 return r.status_code, (await r.aread()).decode("utf-8", "replace")
             async for line in r.aiter_lines():
@@ -100,12 +106,19 @@ async def _post(client, url: str, body: dict, headers: dict, budget: float, emit
                     await emit(out)
             return r.status_code, ""
 
-    # A streamed read timeout is per chunk, not per call; bound the whole call
-    # so the loop's deadlines mean what they meant when steps were not streamed.
+    # The read timeout above is per chunk. A configured deadline bounds the
+    # whole call as well; with none, only silence ends a step.
     try:
-        status, err = await asyncio.wait_for(consume(), timeout=budget)
+        if budget is None:
+            status, err = await consume()
+        else:
+            status, err = await asyncio.wait_for(consume(), timeout=budget)
     except asyncio.TimeoutError as e:
         raise httpx.ReadTimeout(f"model step exceeded {budget:.0f}s") from e
+    except httpx.ReadTimeout as e:
+        raise httpx.ReadTimeout(
+            f"model server silent for {config.STEP_IDLE_TIMEOUT_S:.0f}s mid-step "
+            "(hung slot or dead connection)") from e
     if status >= 400:
         return status, None, err
 
@@ -142,6 +155,19 @@ def _args_of(call: dict) -> dict:
 
 NOTHING_SAID = "(no summary given)"
 
+# Why the tools were withdrawn, told to the model once.
+BUDGET_SPENT = ("Your tool budget is spent. Answer now from what you already "
+                "have, and say plainly what you could not determine.")
+NO_PROGRESS = ("Your last several steps produced nothing new: the same calls, the same "
+               "results. Stop and report now: what you found, what you changed, what is "
+               "still open and what you would need to go further.")
+FORCED = "forced"            # tools withdrawn, reason already given
+
+
+def _fingerprint(name: str, args: dict, out: str) -> str:
+    raw = json.dumps([name, args, out], sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
 
 def _render_finish(args: dict) -> str:
     out = [str(args.get("summary") or "").strip()]
@@ -169,27 +195,41 @@ async def run(client, upstream: str, body: dict, auth: str, compactor,
     headers = {"Authorization": auth} if auth else {}
     last = None
     started = time.monotonic()
-    deadline = started + config.TOOL_MAX_SECONDS
-    hard_deadline = started + config.REQUEST_MAX_SECONDS
+    # Deadlines exist only when configured (0 = none, the default).
+    deadline = started + config.TOOL_MAX_SECONDS if config.TOOL_MAX_SECONDS else None
+    hard_deadline = started + config.REQUEST_MAX_SECONDS if config.REQUEST_MAX_SECONDS else None
     asked_again = False          # one nudge, for a turn that came back empty
     length_cuts = 0              # steps cut off by max_tokens before acting
     loaded: set = set()          # capabilities loaded so far (deferred mode; packs.py)
+    # Why the tools are withdrawn, when they are; None while the model may act.
+    force: str | None = None
+    # Loop detection: every (call, result) pair seen this run, and how many
+    # steps in a row produced nothing new.
+    seen_results: set = set()
+    stale_steps = 0
+    # Learn the window up front, so the first tool result is capped against it
+    # rather than against the fallback.
+    try:
+        await compactor.n_ctx(auth)
+    except Exception:
+        pass
 
-    for step in range(config.TOOL_MAX_STEPS):
-        # Tools are withdrawn on the last step, or once the wall-clock budget
-        # is spent, so the model has to answer rather than start work nobody
-        # will wait for.
-        # Out of time means either budget: the tool budget, or so little left
-        # against the hard deadline that another tool step could only be given a
-        # stub of a timeout and die in the middle. Answering is always the
-        # better use of the last seconds than a step that cannot finish.
+    for step in itertools.count():
+        if config.TOOL_MAX_STEPS and step >= config.TOOL_MAX_STEPS:
+            break
+        # Out of time means either configured budget: the tool budget, or so
+        # little left against the hard deadline that another tool step could
+        # only be given a stub of a timeout and die in the middle.
         now = time.monotonic()
-        remaining = hard_deadline - now
-        out_of_time = now >= deadline or remaining < config.UPSTREAM_MIN_TIMEOUT_S
-        offer_tools = step < config.TOOL_MAX_STEPS - 1 and not out_of_time
-        if out_of_time and step:
-            log.info("agentloop: time budget spent after %d step(s); "
-                     "forcing an answer", step)
+        out_of_time = ((deadline is not None and now >= deadline)
+                       or (hard_deadline is not None
+                           and hard_deadline - now < config.UPSTREAM_MIN_TIMEOUT_S))
+        last_step = bool(config.TOOL_MAX_STEPS) and step >= config.TOOL_MAX_STEPS - 1
+        if force is None and (out_of_time or last_step):
+            force = BUDGET_SPENT
+            if step:
+                log.info("agentloop: budget spent after %d step(s); forcing an answer", step)
+        offer_tools = force is None
         call_body = dict(body)
         call_body["messages"] = messages
         call_body["stream"] = False
@@ -200,27 +240,21 @@ async def run(client, upstream: str, body: dict, auth: str, compactor,
             offered_names = {(d.get("function") or {}).get("name") for d in offered_defs}
         else:
             call_body.pop("tools", None)
-            messages = messages + [{"role": "user", "content":
-                "Your tool budget is spent. Answer now from what you already "
-                "have, and say plainly what you could not determine."}]
+            if force in (BUDGET_SPENT, NO_PROGRESS):
+                messages = messages + [{"role": "user", "content": force}]
+                force = FORCED          # said once; later steps stay tool-free
             call_body["messages"] = messages
 
-        # Never timeout=None: an unbounded call outlives the caller, which then
-        # abandons the request and retries, and the retry competes with the loop
-        # it just abandoned for the same llama.cpp slots.
-        #
-        # The answer gets its OWN budget rather than the remainder, because the
-        # remainder is smallest exactly when the answer matters most — a run
-        # that spent its time gathering evidence would otherwise be given ten
-        # seconds to say what it found, time out, and report nothing at all.
-        budget = (max(config.UPSTREAM_MIN_TIMEOUT_S, hard_deadline - time.monotonic())
-                  if offer_tools else config.ANSWER_TIMEOUT_S)
-        # llama.cpp answers 500 when a sampled tool call comes out malformed —
-        # truncated mid-arguments, usually — and a fresh sample almost always
-        # parses. cluster-agent used to absorb that when it talked to the model
-        # directly; nothing did after the loop moved here, so one bad sample
-        # became a 502 in a phone client's face and a 30-second backoff in the
-        # agent's. Retried here, where the bad sample actually happens.
+        # A step is bounded by silence (STEP_IDLE_TIMEOUT_S, in _post), never by
+        # how long it works. Only a configured deadline adds a wall clock. The
+        # forced answer gets its OWN budget rather than the remainder, because
+        # the remainder is smallest exactly when the answer matters most.
+        if not offer_tools and config.ANSWER_TIMEOUT_S:
+            budget = config.ANSWER_TIMEOUT_S
+        elif hard_deadline is not None:
+            budget = max(config.UPSTREAM_MIN_TIMEOUT_S, hard_deadline - time.monotonic())
+        else:
+            budget = None
         attempt_body = call_body
         for attempt in range(3):
             status, last, err = await _post(client, f"{upstream}/v1/chat/completions",
@@ -318,7 +352,7 @@ async def run(client, upstream: str, body: dict, auth: str, compactor,
                     messages.append({"role": "user", "content":
                                      "That message was empty. Answer the question now, in prose, "
                                      "from what you already have."})
-                    deadline = 0.0
+                    force = FORCED
                     continue
                 text = (msg.get("reasoning_content") or "").strip() \
                     or "(the model returned an empty answer)"
@@ -356,9 +390,10 @@ async def run(client, upstream: str, body: dict, auth: str, compactor,
                 last["choices"][0]["finish_reason"] = "stop"
                 return last, messages
         if empty_finish:
-            deadline = 0.0          # spent: the next step is tool-free by definition
+            force = FORCED          # the next step is tool-free by definition
             continue
 
+        progressed = False
         for call in calls:
             name = (call.get("function") or {}).get("name") or ""
             if id(call) in broken:
@@ -381,6 +416,10 @@ async def run(client, upstream: str, body: dict, auth: str, compactor,
                 out = await tools.apply_load(_args_of(call).get("name"), loaded)
                 log.info("load_capability(%s) -> %s", _args_of(call).get("name"),
                          "error" if out.startswith("ERROR") else "ok")
+                key = _fingerprint(name, _args_of(call), out)
+                if key not in seen_results:
+                    seen_results.add(key)
+                    progressed = True
                 messages.append({"role": "tool", "tool_call_id": call.get("id") or "",
                                  "content": out})
                 continue
@@ -398,10 +437,26 @@ async def run(client, upstream: str, body: dict, auth: str, compactor,
                 continue
             if emit is not None:
                 await emit({"reasoning_content": _describe(name, _args_of(call))})
-            out = await tools.dispatch(name, _args_of(call), emit)
+            args = _args_of(call)
+            out = await tools.dispatch(name, args, emit)
             log.info("tool %s -> %d chars", name, len(out))
+            key = _fingerprint(name, args, out)
+            if key in seen_results:
+                out += ("\n[This exact call already returned exactly this earlier in this "
+                        "run. Use that result; do something different, or finish.]")
+            else:
+                seen_results.add(key)
+                progressed = True
             messages.append({"role": "tool", "tool_call_id": call.get("id") or "",
                              "content": out})
+
+        # Loop detection. Refusals, cut-off calls and capability loads count as
+        # no progress: a model that keeps making them is stuck all the same.
+        stale_steps = 0 if progressed else stale_steps + 1
+        if config.NO_PROGRESS_STEPS and stale_steps >= config.NO_PROGRESS_STEPS and force is None:
+            log.warning("agentloop: %d steps with no new tool results; forcing a report",
+                        stale_steps)
+            force = NO_PROGRESS
 
         # Tool results are the thing that overflows the window.
         try:
