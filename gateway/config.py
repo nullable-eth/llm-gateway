@@ -114,34 +114,46 @@ SAMPLING_KEEP_CLIENTS = {c.strip() for c in os.environ.get(
 # "turn off the kitchen light" should not be paying for tool definitions, and
 # should not be holding cluster tools.
 TOOLS_ENABLED = os.environ.get("GATEWAY_TOOLS", "0") not in ("0", "false", "no", "")
-# Raised from 8 after a real incident: eight steps was not enough to even
-# IDENTIFY a failing target, let alone fix it. The agent spent all eight on
-# discovery, reported "budget ran out before I could check", and changed
-# nothing, while the fault sat two kubectl calls away. Prefer dozens of cheap
-# calls over a confident shrug.
-TOOL_MAX_STEPS = int(os.environ.get("TOOL_MAX_STEPS", "40"))
-# Wall-clock budget for starting NEW tool work, in seconds. A step budget does
-# not bound time: steps get slower as the conversation grows, so 12 steps can
-# be two minutes or twelve. Callers have their own timeouts — cluster-agent
-# waits 1800s — and a loop that outruns them does the work, gets abandoned, and
-# reports nothing. Past this the tools are withdrawn and the model must answer,
-# leaving the remainder of the caller's patience for that final reply.
-TOOL_MAX_SECONDS = int(os.environ.get("TOOL_MAX_SECONDS", "1200"))
-# ...and a hard ceiling on the whole request, because withdrawing the tools does
-# not bound anything on its own: the final generation was issued with no timeout
-# at all, so a loop could and did run past the caller's patience and get
-# abandoned mid-answer. Every upstream call now gets the time remaining against
-# this deadline (never less than the floor), so the request either answers
-# inside REQUEST_MAX_SECONDS or fails as a timeout the caller can report,
-# instead of racing it.
-REQUEST_MAX_SECONDS = int(os.environ.get("REQUEST_MAX_SECONDS", "1440"))
+# Runs are unbounded by default: no step count, no wall clock, no per-step
+# token cap (the caller decides max_tokens; cluster-agent sends none). Budgets
+# were the failure, not the protection: on 2026-09-26 an agent with 80 steps
+# and 40 minutes stopped after 5 calls and 12 minutes, because a budget it was
+# told was tight made it spend a whole step deliberating, and a step cap cut
+# that step off. The context window is bounded by compaction instead, a hang by
+# STEP_IDLE_TIMEOUT_S, and a loop by NO_PROGRESS_STEPS. 0 = unlimited for the
+# four below; set them only for a caller that cannot wait.
+TOOL_MAX_STEPS = int(os.environ.get("TOOL_MAX_STEPS", "0"))
+# Past this many seconds the tools are withdrawn and the model must answer.
+TOOL_MAX_SECONDS = int(os.environ.get("TOOL_MAX_SECONDS", "0"))
+# Hard ceiling on the whole request, loop included. Every upstream call gets the
+# time remaining against it (never less than UPSTREAM_MIN_TIMEOUT_S).
+REQUEST_MAX_SECONDS = int(os.environ.get("REQUEST_MAX_SECONDS", "0"))
 UPSTREAM_MIN_TIMEOUT_S = int(os.environ.get("UPSTREAM_MIN_TIMEOUT_S", "30"))
-# The final answer's own budget, on top of the deadline above rather than
-# inside it. Worst case per request is therefore ~REQUEST_MAX + ANSWER_TIMEOUT,
-# which must stay under the caller's timeout (cluster-agent: 1800s). 1440+240
-# leaves 2 minutes of headroom.
-ANSWER_TIMEOUT_S = int(os.environ.get("ANSWER_TIMEOUT_S", "240"))
-TOOL_OUTPUT_MAX = int(os.environ.get("TOOL_OUTPUT_MAX", "8000"))
+# A forced final answer's own time limit, on top of REQUEST_MAX_SECONDS.
+ANSWER_TIMEOUT_S = int(os.environ.get("ANSWER_TIMEOUT_S", "0"))
+# Hang detection, not a budget: the longest silence tolerated from the model
+# server within one step. Every step is streamed from upstream, so a working
+# model is never silent this long; a dead one (a wedged llama.cpp slot, a
+# half-open connection) is, and the run then fails and is REPORTED rather than
+# sending keepalives to its caller forever. Covers prompt processing too,
+# which streams nothing: a full re-read of a 200k-token window is minutes.
+STEP_IDLE_TIMEOUT_S = float(os.environ.get("STEP_IDLE_TIMEOUT_S", "900"))
+# Loop detection, not a budget: a step makes progress when at least one of its
+# tool calls returns something the run has not already seen from that same
+# call. This many steps in a row with no progress (the same calls, the same
+# answers) and the tools are withdrawn so the model has to report. Polling a
+# rollout that is actually changing is progress; re-reading a file is not.
+NO_PROGRESS_STEPS = int(os.environ.get("NO_PROGRESS_STEPS", "4"))
+# One tool result's cap, in characters. 0 = derived from the model's window:
+# TOOL_OUTPUT_CTX_SHARE of it, at ~3 chars per token (compaction's own
+# under-estimate). A single result can never be compacted — it is the newest
+# message — so an uncapped `get -A -o yaml` would overflow the window and end
+# the run with no report. At 262k tokens a result may be ~190 KB, which is
+# every file and any narrowed listing whole.
+TOOL_OUTPUT_MAX = int(os.environ.get("TOOL_OUTPUT_MAX", "0"))
+TOOL_OUTPUT_CTX_SHARE = float(os.environ.get("TOOL_OUTPUT_CTX_SHARE", "0.25"))
+# Until the window is known (no /props yet), this is the cap.
+TOOL_OUTPUT_FALLBACK = int(os.environ.get("TOOL_OUTPUT_FALLBACK", "100000"))
 # How many times a step cut off by max_tokens before it called anything is
 # nudged to act, tools still offered, before it is treated as the answer.
 LENGTH_CUT_RETRIES = int(os.environ.get("LENGTH_CUT_RETRIES", "3"))
@@ -175,8 +187,8 @@ def mcp_token() -> str:
     return _mcp_token_cache["value"]
 
 
-# One tool call's limit. Exec'd commands and log queries can be slow; the
-# loop's own deadlines still bound the whole run.
+# One tool call's limit: hang detection for a tool server that never answers.
+# Exec'd commands and log queries can be slow, so keep it generous.
 MCP_CALL_TIMEOUT_S = float(os.environ.get("MCP_CALL_TIMEOUT_S", "120"))
 # How long a tools/list is reused. New or removed tools appear within this.
 MCP_TOOLS_TTL_S = float(os.environ.get("MCP_TOOLS_TTL_S", "60"))

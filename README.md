@@ -103,10 +103,12 @@ inference key may do, and restrict who can reach the model port.
 | `MCP_TOOLS_TTL_S` | `60` | How long a `tools/list` is reused |
 | `TOOL_READ_ONLY_PATTERN` | *(empty)* | Regex of tool names to report as reads when the server does not annotate them (`readOnlyHint` always wins) |
 | `MCP_INSTRUCTIONS_MAX` | `4000` | Cap on the endpoint instructions appended to the policy |
-| `TOOL_MAX_STEPS` | `40` | Model+tool round trips before it must answer |
-| `TOOL_MAX_SECONDS` | `1200` | Wall-clock budget for starting new tool work; past it the tools are withdrawn |
-| `REQUEST_MAX_SECONDS` | `1440` | Ceiling on the whole request, loop included |
-| `TOOL_OUTPUT_MAX` | `8000` | Characters of one tool result the model sees |
+| `TOOL_MAX_STEPS` | `0` | Model+tool round trips before it must answer (0 = unlimited) |
+| `TOOL_MAX_SECONDS` | `0` | Wall-clock budget for starting new tool work; past it the tools are withdrawn (0 = unlimited) |
+| `REQUEST_MAX_SECONDS` | `0` | Ceiling on the whole request, loop included (0 = unlimited) |
+| `STEP_IDLE_TIMEOUT_S` | `900` | Longest silence from the model server within a step: hang detection, not a budget |
+| `NO_PROGRESS_STEPS` | `4` | Steps in a row whose tool calls return only what the run has already seen before the tools are withdrawn and it must report (0 = off) |
+| `TOOL_OUTPUT_MAX` | `0` | Characters of one tool result the model sees (0 = `TOOL_OUTPUT_CTX_SHARE`, default 0.25, of the model's window) |
 | `TOOL_SYSTEM_PROMPT` | *(built-in)* | Tool-use policy appended to the caller's system message; empty disables |
 
 Full list in `gateway/config.py`, which is the only place env is read.
@@ -121,13 +123,18 @@ Full list in `gateway/config.py`, which is the only place env is read.
   a tool runs, and because the status line is already sent, a failure arrives
   in-band as a final `[gateway: agent loop failed/timed out]` chunk rather
   than a 502/504. Non-streaming callers (cluster-agent) are unchanged.
-- **A loop must finish inside its caller's patience.** Steps do not bound
-  wall clock — they get slower as the conversation grows — so there is a
-  separate `TOOL_MAX_SECONDS` budget, past which the tools are withdrawn and
-  the model must answer. A loop that outruns its caller does the work, gets
-  abandoned, and reports nothing: cluster-agent waits 300s and then posts
-  `LLM error at step 1:` with an empty message, because `httpx.ReadTimeout`
-  stringifies to nothing.
+- **A loop runs until it is done, and always reports.** There is no step,
+  time or token budget by default: budgets were what ended runs early (an
+  agent stopped 5 calls into an 80-call budget after spending a whole step
+  deliberating over it). What remains are guards, not budgets: compaction keeps
+  the conversation inside the window, one tool result is capped at a share of
+  the window (a single result cannot be compacted), a model server silent for
+  `STEP_IDLE_TIMEOUT_S` fails the run in-band so the caller can report it, and
+  `NO_PROGRESS_STEPS` steps of the same calls returning the same results
+  withdraw the tools so a stuck model has to report instead of looping. Every
+  upstream step is streamed, which is what makes a hang visible. The budgets
+  still exist (`TOOL_MAX_STEPS`, `TOOL_MAX_SECONDS`, `REQUEST_MAX_SECONDS`) for
+  a caller that cannot wait.
 - **Concurrency is the server's.** With `--parallel 1` a tool loop holds the
   only slot for its whole run, so an alert investigation and an interactive
   question block each other. Raising `--parallel` partitions the same

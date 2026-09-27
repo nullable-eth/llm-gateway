@@ -144,6 +144,22 @@ async def dispatch(name: str, args: dict, emit=None) -> str:
     return out
 
 
+def output_cap() -> int:
+    """Characters of one tool result the model may see.
+
+    Fixed when TOOL_OUTPUT_MAX is set; otherwise a share of the model's window,
+    as last probed by compaction (/props), so a bigger window means bigger
+    results with no config change.
+    """
+    if config.TOOL_OUTPUT_MAX > 0:
+        return config.TOOL_OUTPUT_MAX
+    from .compact import _ctx_cache            # the window compaction already probed
+    n_ctx = config.COMPACT_N_CTX or _ctx_cache.get("n_ctx") or 0
+    if not n_ctx:
+        return config.TOOL_OUTPUT_FALLBACK
+    return max(8000, int(n_ctx * config.TOOL_OUTPUT_CTX_SHARE * 3))
+
+
 async def _dispatch(name: str, args: dict) -> tuple[str, bool]:
     client = mcpclient.get()
     if client is None:
@@ -157,8 +173,11 @@ async def _dispatch(name: str, args: dict) -> tuple[str, bool]:
         # A policy refusal arrives here too (a JSON-RPC error from the MCP
         # gateway). It is an answer, not a crash: hand it to the model.
         return f"ERROR: {e}", True
-    if len(text) > config.TOOL_OUTPUT_MAX:
-        text = (text[:config.TOOL_OUTPUT_MAX]
-                + f"\n[... truncated {len(text) - config.TOOL_OUTPUT_MAX} chars; "
-                  "ask for less: a namespace, a name, a limit, a time range]")
+    cap = output_cap()
+    if len(text) > cap:
+        text = (text[:cap]
+                + f"\n[... truncated {len(text) - cap} of {len(text)} chars: one result may "
+                  "not fill the context window. Narrow it — a namespace, a name, a field "
+                  "selector, a jsonpath, a limit, a time range — rather than rebuilding "
+                  "the missing part from another source]")
     return (f"ERROR: {text}" if is_error else text) or "(no output)", is_error

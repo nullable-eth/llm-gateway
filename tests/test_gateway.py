@@ -715,6 +715,13 @@ async def run_all():
           (await gtools.dispatch("nope", {})).startswith("ERROR: unknown tool"))
     out = await gtools.dispatch("big_output", {})
     check("oversized output is truncated with a hint", len(out) < 9000 and "truncated" in out, len(out))
+    from gateway import compact as _gc, tools as _gt
+    was_ctx, _gc._ctx_cache["n_ctx"] = _gc._ctx_cache["n_ctx"], 262144
+    try:
+        check("with no fixed cap, one result may take a quarter of the window",
+              _gt.output_cap() == int(262144 * 0.25 * 3), str(_gt.output_cap()))
+    finally:
+        _gc._ctx_cache["n_ctx"] = was_ctx
     out = await gtools.dispatch("structured_only", {})
     check("structured content is rendered when there is no text", '"n": 3' in out, out)
     check("without a listener, dispatch still runs",
@@ -782,9 +789,9 @@ async def run_all():
             senders = [x[2] for x in rows(t)]
             check("every archived step still chunks with a sender",
                   senders == ["User", "Claude", "User", "Claude"], str(senders))
-        # Wall clock, not just steps: a caller with its own timeout (cluster-agent
-        # waits 300s) must get an answer, not an abandoned investigation.
-        was_secs, gcfg.TOOL_MAX_SECONDS = gcfg.TOOL_MAX_SECONDS, 0
+        # A CONFIGURED wall clock (0 = none, the default) still works: a caller
+        # with its own timeout must get an answer, not an abandoned run.
+        was_secs, gcfg.TOOL_MAX_SECONDS = gcfg.TOOL_MAX_SECONDS, 1e-9
         try:
             NEXT_QUEUE[:] = [{"content": "Answering from what I have."}]
             obj = await chat([{"role": "user", "content": "Out of time please."}],
@@ -914,6 +921,66 @@ async def run_all():
               "PR opened." in deltas(frames, "content"),
               repr(deltas(frames, "content"))[:200])
         NEXT_QUEUE.clear()
+
+        # Unbounded by default: more steps than the old 40-step cap, all run.
+        def pods(i, ns):
+            return {"tool_calls": [{"id": f"u{i}", "type": "function", "function": {
+                "name": "kubernetes_pods_list",
+                "arguments": json.dumps({"namespace": ns})}}]}
+        before = list(_fm.STATE["calls"])
+        NEXT_QUEUE[:] = [pods(i, f"ns{i}") for i in range(45)] + [{"content": "Walked 45."}]
+        frames = await stream_frames(
+            [{"role": "user", "content": "Long investigation."}], AUTH)
+        ran = _fm.STATE["calls"][len(before):]
+        check("no step cap by default: 45 distinct calls all run",
+              len(ran) == 45, str(len(ran)))
+        check("and the run still reports",
+              "Walked 45." in deltas(frames, "content"), repr(deltas(frames, "content"))[:200])
+        NEXT_QUEUE.clear()
+
+        # A loop is the same calls getting the same answers: after
+        # NO_PROGRESS_STEPS of those the tools go and the model must report.
+        n = gcfg.NO_PROGRESS_STEPS
+        before = list(_fm.STATE["calls"])
+        NEXT_QUEUE[:] = [pods(i, "media") for i in range(n + 1)] + [{"content": "Stuck on pods."}]
+        frames = await stream_frames(
+            [{"role": "user", "content": "Loop on one call."}], AUTH)
+        ran = _fm.STATE["calls"][len(before):]
+        check("a looping run is stopped after NO_PROGRESS_STEPS stale steps",
+              len(ran) == n + 1, str(len(ran)))
+        check("with its tools withdrawn and told why",
+              "tools" not in LAST_UPSTREAM
+              and "produced nothing new" in json.dumps(LAST_UPSTREAM),
+              json.dumps(LAST_UPSTREAM)[-300:])
+        check("and it reports",
+              "Stuck on pods." in deltas(frames, "content"), repr(deltas(frames, "content"))[:200])
+        NEXT_QUEUE.clear()
+
+        # Repeating a call whose answer changes (polling a rollout) is progress.
+        before = list(_fm.STATE["calls"])
+        NEXT_QUEUE[:] = ([pods(0, "media")] + [pods(i, f"poll{i}") for i in range(1, n + 3)]
+                         + [{"content": "Rollout done."}])
+        frames = await stream_frames(
+            [{"role": "user", "content": "Poll a rollout."}], AUTH)
+        ran = _fm.STATE["calls"][len(before):]
+        check("changing results are progress, never cut off",
+              len(ran) == n + 3 and "produced nothing new" not in json.dumps(LAST_UPSTREAM),
+              str(len(ran)))
+        NEXT_QUEUE.clear()
+
+        # A hung model server is detected by silence, not by a budget, and the
+        # run fails in-band so the caller can report it.
+        was_idle, gcfg.STEP_IDLE_TIMEOUT_S = gcfg.STEP_IDLE_TIMEOUT_S, 0.3
+        try:
+            NEXT_QUEUE[:] = [{"reasoning": "thinking very slowly indeed", "delay": 1.0}]
+            frames = await stream_frames(
+                [{"role": "user", "content": "Hang please."}], AUTH)
+            text = deltas(frames, "content")
+            check("a silent model server fails the run in-band instead of hanging",
+                  "[gateway: agent loop" in text and "silent" in text, repr(text)[:300])
+        finally:
+            gcfg.STEP_IDLE_TIMEOUT_S = was_idle
+            NEXT_QUEUE.clear()
 
         NEXT_QUEUE[:] = [{"status": 500}, {"status": 500}, {"status": 500}]
         frames = await stream_frames(
