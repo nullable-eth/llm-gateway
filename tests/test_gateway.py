@@ -228,6 +228,19 @@ async def chat(messages, stream=True, headers=None, abort_after=None, extra=None
     return None
 
 
+async def stream_frames_extra(messages, headers, extra):
+    """Raw SSE data lines for a streamed request carrying extra body fields."""
+    payload = {"model": "qwen3.8-27b", "messages": messages, "stream": True, **extra}
+    out = []
+    async with httpx.AsyncClient(timeout=30) as c:
+        async with c.stream("POST", f"{PROXY}/v1/chat/completions",
+                            json=payload, headers=headers) as r:
+            async for line in r.aiter_lines():
+                if line.startswith("data: "):
+                    out.append(line[6:])
+    return out
+
+
 async def stream_frames(messages, headers=None):
     """POST a streamed chat and return [(seconds_since_start, obj)]."""
     import time as _t
@@ -1103,6 +1116,35 @@ async def run_proxy() -> None:
         check("captured (teed) chat requests ask upstream for identity",
               SEEN_AE and all(a == "identity" for a in SEEN_AE), SEEN_AE)
         gcfg.TOOLS_ENABLED = True
+
+        print("\n[proxy] a client with its own tools owns the tool loop")
+        own = [{"type": "function", "function": {
+            "name": "getLibraries", "description": "List media libraries",
+            "parameters": {"type": "object", "properties": {}}}}]
+        call = {"id": "c1", "type": "function", "function": {
+            "name": "getLibraries", "arguments": "{}"}}
+        mcp_before = len(fake_mcp.STATE["calls"])
+        NEXT_QUEUE[:] = [{"tool_calls": [call], "finish": "tool_calls"}]
+        obj = await chat([{"role": "user", "content": "What libraries do I have?"}],
+                         stream=False, headers=AUTH, extra={"tools": own})
+        names = [(t.get("function") or {}).get("name")
+                 for t in LAST_UPSTREAM.get("tools") or []]
+        check("the client's tools reach the model, and only those",
+              names == ["getLibraries"], names)
+        check("no gateway policy is injected into its conversation",
+              [m.get("role") for m in LAST_UPSTREAM.get("messages") or []] == ["user"],
+              str(LAST_UPSTREAM.get("messages"))[:200])
+        got = (obj.get("choices") or [{}])[0].get("message", {}).get("tool_calls") or []
+        check("the model's call on a client tool is handed back to the client",
+              [c["function"]["name"] for c in got] == ["getLibraries"], str(obj)[:200])
+        check("and the gateway never ran a tool of its own",
+              len(fake_mcp.STATE["calls"]) == mcp_before)
+
+        NEXT_QUEUE[:] = [{"tool_calls": [call], "finish": "tool_calls"}]
+        frames = await stream_frames_extra(
+            [{"role": "user", "content": "Stream my libraries."}], AUTH, {"tools": own})
+        check("streamed: the client's tool call arrives as tool_call deltas",
+              any("getLibraries" in f for f in frames), str(frames)[:200])
 
         async def open_and_drop(headers):
             slow = {"reasoning": "thinking " * 60, "delay": 0.05, "content": "late"}
