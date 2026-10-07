@@ -324,6 +324,12 @@ def _strip_sampling(body: bytes):
 
 
 # -------------------------------------------------------------- the proxy
+def _client_tools(body: dict) -> bool:
+    """True when the client brought its own tools (OpenAI `tools`, or the
+    legacy `functions`) and therefore owns the tool loop."""
+    return bool(body.get("tools") or body.get("functions"))
+
+
 @app.api_route("/{path:path}",
                methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD",
                         "OPTIONS"])
@@ -384,7 +390,16 @@ async def proxy(path: str, request: Request):
     # Tool link. The loop calls the model repeatedly and runs what it asks
     # for; the client gets one finished reply and needs no tool support of its
     # own. The archive gets the whole loop, which the client never saw.
-    if parsed is not None and config.TOOLS_ENABLED:
+    #
+    # Only for clients WITHOUT tools of their own. A client that sends `tools`
+    # (an app built around its own functions, e.g. lookups into its own data)
+    # runs its own loop: replacing its tools with ours left the model unable
+    # to do the job it was asked for, and our policy prompt told it to go
+    # looking in packs that have nothing for it. Such a request takes the
+    # plain path below -- still compacted, still captured -- with its tools
+    # and tool_calls passed through untouched.
+    if (parsed is not None and config.TOOLS_ENABLED
+            and not _client_tools(fwd or parsed)):
         auth = request.headers.get("authorization") or ""
         loop_body = dict(new_body or fwd)
         await tools.offered()      # connects and caches; the policy carries its instructions

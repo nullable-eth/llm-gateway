@@ -69,6 +69,12 @@ appended to it. `TOOL_SYSTEM_PROMPT=""` disables it. The client sees a single re
 every tool call, result and intermediate thought. Compaction runs *between*
 steps too, because tool output is what actually overflows a window.
 
+A client that sends **its own** `tools` (or legacy `functions`) owns the tool
+loop: the gateway leaves its tools, its conversation and the model's
+`tool_calls` untouched, adds neither the endpoint's tools nor the policy, and
+only captures and compacts. An app built around its own functions keeps
+working behind the gateway instead of being handed tools it never asked for.
+
 ## Credentials
 
 The gateway holds no API key and should not be given one. Its own calls —
