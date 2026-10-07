@@ -203,8 +203,24 @@ class Compactor:
             return None, info
 
         head, cut = self._split(messages)
-        span = messages[len(head):cut]
-        if not span:
+        # The question being answered is never summarised away. In a long
+        # agentic turn (one user message, then many tool steps) the fixed-size
+        # tail holds only assistant/tool messages, and summarising the user
+        # message with the rest leaves a conversation with no user turn at all,
+        # which chat templates refuse outright (Qwen: "No user query found in
+        # messages"). When the last user message falls in the span it stays
+        # verbatim, in place: what came before it and the steps taken since are
+        # summarised separately on either side of it.
+        last_user = max((i for i, m in enumerate(messages)
+                         if m.get("role") == "user"), default=-1)
+        if len(head) <= last_user < cut:
+            parts = [messages[len(head):last_user], messages[last_user + 1:cut]]
+            keep = messages[last_user]
+        else:
+            parts = [messages[len(head):cut], []]
+            keep = None
+        span_len = len(parts[0]) + len(parts[1])
+        if not span_len:
             # Nothing between the system prompt and the tail: the tail alone
             # is over budget, which compaction cannot fix. Let the server
             # decide rather than silently mangling the request.
@@ -213,23 +229,28 @@ class Compactor:
             return None, info
         try:
             async with self._lock:        # one slot upstream; serialise
-                summary = await self._summary_for(span, auth)
+                summaries = [await self._summary_for(part, auth) if part else None
+                             for part in parts]
         except Exception as e:
             log.warning("compact: summarise failed (%s); forwarding unchanged", e)
             return None, info
 
-        new_messages = head + [{"role": "assistant",
-                                "content": f"{SUMMARY_MARKER}\n{summary}"}] \
-            + messages[cut:]
+        def _state(text):
+            return [{"role": "assistant",
+                     "content": f"{SUMMARY_MARKER}\n{text}"}] if text else []
+
+        new_messages = (head + _state(summaries[0])
+                        + ([keep] if keep is not None else [])
+                        + _state(summaries[1]) + messages[cut:])
         new_body = dict(body)
         new_body["messages"] = new_messages
         try:
             info["tokens_after"] = await self.count_tokens(new_messages, auth)
         except Exception:
             pass
-        info.update(compacted=True, summarised_messages=len(span),
+        info.update(compacted=True, summarised_messages=span_len,
                     kept_tail=len(messages) - cut, budget=budget, n_ctx=n_ctx)
         log.info("compact: %s tokens -> %s (summarised %d message(s), kept %d)",
                  info.get("tokens_before"), info.get("tokens_after", "?"),
-                 len(span), len(messages) - cut)
+                 span_len, len(messages) - cut)
         return new_body, info

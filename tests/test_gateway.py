@@ -50,6 +50,7 @@ NEXT: dict = {}
 NEXT_QUEUE: list = []   # popped per upstream call, for multi-step loops
 FAILURES: list = []
 BAD_HISTORY: list = []   # requests llama.cpp would have refused
+NO_USER: list = []       # requests with no user turn (template refuses them)
 
 fake = FastAPI()
 
@@ -106,6 +107,12 @@ async def completions(request: Request):
             {"index": 0, "finish_reason": "stop", "message": {
                 "role": "assistant",
                 "content": "STATE: user is migrating the cluster; PVCs renamed."}}]}
+    # Like llama.cpp under the Qwen chat template: a conversation with no user
+    # turn cannot be rendered at all.
+    if not any(m.get("role") == "user" for m in body.get("messages") or []):
+        NO_USER.append(body)
+        return JSONResponse({"error": {"code": 500, "message":
+            "Jinja Exception: No user query found in messages."}}, status_code=500)
     # Like llama.cpp: a history whose tool-call arguments are not JSON cannot
     # be rendered into the chat template, and every request carrying it fails.
     for m in body.get("messages") or []:
@@ -571,6 +578,33 @@ async def run_all():
         ctext = cf[0].read_text(encoding="utf-8")
         check("and records that the model answered from a summary",
               "context_compacted" in ctext)
+
+    print("\n[9c2] a long agentic turn keeps its question")
+    # One question, then many tool steps: the fixed tail is all assistant/tool.
+    agentic = [{"role": "system", "content": "You help with watch history."},
+               {"role": "user", "content": "Recommend apocalyptic films I have not seen"}]
+    for i in range(20):
+        agentic.append({"role": "assistant", "content": None, "tool_calls": [
+            {"id": f"a{i}", "type": "function",
+             "function": {"name": "getHistoryByFilters", "arguments": "{}"}}]})
+        agentic.append({"role": "tool", "tool_call_id": f"a{i}",
+                        "content": f"rows {i} " + "z" * 400})
+    NO_USER.clear()
+    NEXT = {"content": "Here are three picks."}
+    obj = await chat(agentic, stream=False, headers=AUTH)
+    up = LAST_UPSTREAM.get("messages", [])
+    check("an oversized agentic turn is compacted", len(up) < len(agentic),
+          f"{len(agentic)} -> {len(up)}")
+    check("its question survives verbatim, once",
+          [m.get("content") for m in up if m.get("role") == "user"]
+          == ["Recommend apocalyptic films I have not seen"],
+          str([m.get("role") for m in up]))
+    check("in order: system, question, summary of steps, recent steps",
+          [m.get("role") for m in up[:3]] == ["system", "user", "assistant"]
+          and "[COMPACTED CONVERSATION STATE]" in str(up[2].get("content")),
+          str([m.get("role") for m in up[:4]]))
+    check("and the model can render it (no 'No user query' refusal)",
+          not NO_USER and "three picks" in json.dumps(obj), str(obj)[:200])
 
     print("\n[9d] compaction never breaks a request")
     NEXT = {"content": "unauth answer"}
